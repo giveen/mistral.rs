@@ -2052,9 +2052,14 @@ impl PagedAttention {
     /// live at capture time, silently wrong for any other request). Mirrors the native
     /// (non-Turbo4) decode path's `run_decode_gather_sdpa`.
     ///
-    /// Only handles `AttentionMask::None`/`CausalFlash`; `forward_turbo4` falls back to the
-    /// per-row loop for `AttentionMask::Custom` (noncausal multimodal prefix ranges etc), which
-    /// this doesn't attempt to reconstruct in padded/batched form.
+    /// Handles `AttentionMask::None`/`CausalFlash` for any batch size, and `Custom` only when
+    /// `batch_size == 1` (the caller enforces this): a single-row batch never triggers
+    /// `unpack_gathered_kv`'s padding (`max_kv` is trivially that row's own `kv_len`), so a
+    /// caller-built `Custom` mask -- e.g. a noncausal multimodal prefix-range mask -- already
+    /// matches `k_batched`/`v_batched` exactly with no reconstruction needed. `forward_turbo4`
+    /// still falls back to the per-row loop for `Custom` masks with `batch_size > 1`: nothing
+    /// here would know how to re-pad an arbitrary caller-built per-row mask to `max_kv` once
+    /// rows can actually diverge.
     #[cfg(all(feature = "cuda", target_family = "unix"))]
     #[allow(clippy::too_many_arguments)]
     fn forward_turbo4_batched_gather(
@@ -2119,21 +2124,30 @@ impl PagedAttention {
         // mask has no way to know about that padding, so rebuild an explicit mask whenever
         // lengths actually differ (or a sliding window needs one regardless).
         let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
-        let mask = if ctx.sdpa_params.sliding_window.is_some()
-            || kv_lens.iter().any(|&len| len != max_kv)
-        {
-            prefix_gather_causal_mask(
-                &vec![seq_len; batch_size],
-                &kv_lens,
-                None,
-                seq_len,
-                max_kv,
-                ctx.sdpa_params.sliding_window,
-                query.dtype(),
-                device,
-            )?
-        } else {
-            tensors.attention_mask.clone()
+        let mask = match tensors.attention_mask {
+            AttentionMask::Custom(_) => {
+                // Only reached with batch_size == 1 (forward_turbo4's dispatch condition keeps
+                // batch_size > 1 Custom masks on the per-row loop). kv_lens then has exactly
+                // one entry, so max_kv == kv_lens[0] and unpack_gathered_kv never pads --
+                // the caller's mask already matches k_batched/v_batched as-is.
+                debug_assert_eq!(batch_size, 1, "batched Custom mask path assumes batch_size == 1");
+                tensors.attention_mask.clone()
+            }
+            _ if ctx.sdpa_params.sliding_window.is_some()
+                || kv_lens.iter().any(|&len| len != max_kv) =>
+            {
+                prefix_gather_causal_mask(
+                    &vec![seq_len; batch_size],
+                    &kv_lens,
+                    None,
+                    seq_len,
+                    max_kv,
+                    ctx.sdpa_params.sliding_window,
+                    query.dtype(),
+                    device,
+                )?
+            }
+            _ => tensors.attention_mask.clone(),
         };
 
         Sdpa.run_attention(query, &k_batched, &v_batched, &mask, None, ctx.sdpa_params)
@@ -2287,7 +2301,9 @@ impl PagedAttention {
         };
 
         #[cfg(all(feature = "cuda", target_family = "unix"))]
-        if device.is_cuda() && !matches!(tensors.attention_mask, AttentionMask::Custom(_)) {
+        if device.is_cuda()
+            && (batch_size == 1 || !matches!(tensors.attention_mask, AttentionMask::Custom(_)))
+        {
             return self.forward_turbo4_batched_gather(
                 ctx,
                 tensors,
@@ -2683,6 +2699,108 @@ mod tests {
             return Ok(());
         };
         turbo4_forward_matches_direct_attention_closely_on(device)
+    }
+
+    /// Same idea as [`turbo4_forward_matches_direct_attention_closely_on`] but with an
+    /// `AttentionMask::Custom` mask and `batch_size == 1`, to exercise
+    /// `forward_turbo4_batched_gather`'s Custom-mask branch specifically (CPU always uses the
+    /// per-row loop regardless of mask type, so this needs CUDA to actually hit the new code
+    /// path). The mask masks out the last key position for every query -- distinctive enough
+    /// that a mask silently dropped on the floor would show up as a real divergence from the
+    /// reference, not just quantization noise.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn turbo4_forward_with_custom_mask_batch_one_matches_direct_attention() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        const HEADS: usize = 2;
+        const KV_HEADS: usize = 2;
+        const SEQ_LEN: usize = 3;
+        const HEAD_SIZE: usize = turbo_quant::GROUP;
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 2;
+
+        let query = Tensor::from_vec(
+            fake_values(11, HEADS * SEQ_LEN * HEAD_SIZE),
+            (1, HEADS, SEQ_LEN, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let key = Tensor::from_vec(
+            fake_values(12, KV_HEADS * SEQ_LEN * HEAD_SIZE),
+            (1, KV_HEADS, SEQ_LEN, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let value = Tensor::from_vec(
+            fake_values(13, KV_HEADS * SEQ_LEN * HEAD_SIZE),
+            (1, KV_HEADS, SEQ_LEN, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+
+        let cache_shape = (
+            NUM_GPU_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            1,
+            turbo_quant::BLOCK_TURBO4_BYTES,
+        );
+        let key_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
+        let value_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
+
+        let mut input_metadata = PagedAttentionInputMetadata::dummy(&device)?;
+        input_metadata.is_turbo4_model = true;
+        input_metadata.slot_mappings = HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0i64, 1, 2], (1, SEQ_LEN), &device)?,
+        )]);
+        input_metadata.block_tables = Some(HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0u32], (1, 1), &device)?,
+        )]));
+        input_metadata.paged_context_lens_cpu = Some(vec![SEQ_LEN]);
+
+        let sdpa_params = SdpaParams {
+            n_kv_groups: HEADS / KV_HEADS,
+            softcap: None,
+            softmax_scale: 1.0 / (HEAD_SIZE as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+
+        let mut mask_vals = vec![0f32; SEQ_LEN * SEQ_LEN];
+        for q in 0..SEQ_LEN {
+            mask_vals[q * SEQ_LEN + (SEQ_LEN - 1)] = f32::NEG_INFINITY;
+        }
+        let mask_tensor = Tensor::from_vec(mask_vals, (1, 1, SEQ_LEN, SEQ_LEN), &device)?
+            .to_dtype(DType::BF16)?;
+        let mask = AttentionMask::Custom(mask_tensor);
+
+        let pa = PagedAttention::new(HEAD_SIZE, &device, None)?;
+        let turbo_out = pa.forward(
+            &query,
+            &key,
+            &value,
+            &mask,
+            Some(key_cache),
+            Some(value_cache),
+            &input_metadata,
+            &sdpa_params,
+            None,
+        )?;
+
+        let reference_out = Sdpa.run_attention(&query, &key, &value, &mask, None, &sdpa_params)?;
+
+        assert_eq!(turbo_out.dims(), reference_out.dims());
+        let sim = cosine_similarity(&turbo_out, &reference_out)?;
+        assert!(
+            sim > 0.9,
+            "turbo4 attention with a Custom mask diverged too much: cosine={sim}"
+        );
+        Ok(())
     }
 
     #[test]
