@@ -10,6 +10,7 @@ use super::config::{KvCacheLayout, ModelConfigLike};
 use super::turbo_quant;
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 use crate::flashinfer::{register_fa3_prefill_caches, Fa3PrefillWorkspaceRegistration};
+use tracing::warn;
 
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 fn cuda_supports_fp8(device: &Device) -> bool {
@@ -102,6 +103,25 @@ impl PagedCacheType {
             // path, not the native reshape_and_cache/paged-attention kernels (which only understand
             // f32/f16/bf16/f8e4m3 element layouts). It doesn't support donor-cache (speculative
             // decoding) attention yet, or MLA (checked above).
+            //
+            // Fixed-precision 4-bit quantization is lossy in a way plain per-vector fidelity checks
+            // don't reveal: softmax attention amplifies small per-key errors non-linearly (most
+            // acutely in early layers where attention is more diffuse), and that per-layer error
+            // compounds through the residual stream. On models whose K/V vectors aren't pre-conditioned
+            // to a controlled scale (e.g. no QK-norm), this has been observed to degrade output to
+            // complete incoherence even though per-vector round-trip cosine similarity looks fine
+            // (~99.5%). No reliable signal was found to auto-detect which models are affected -- key
+            // norm variance, the natural suspect, does not cleanly separate a known-good model
+            // (Qwen3, which applies QK-norm) from a known-bad one (Qwen2.5) in practice. Warn on every
+            // use rather than silently risk this on an unverified model.
+            warn!(
+                "Turbo4 KV cache uses lossy fixed-precision 4-bit quantization. It has been verified \
+                 to produce coherent output on Qwen3 (which applies QK-norm before caching K/V), but \
+                 has been observed to silently degrade output to incoherence on at least one model \
+                 without QK-norm (Qwen2.5), despite the underlying quantization looking numerically \
+                 fine in isolation. Validate output quality for your specific model before relying on \
+                 this in production; if it degrades, F8E4M3 is a safer lossy option."
+            );
             return Ok(());
         }
         if !matches!(act_dtype, DType::F16 | DType::BF16 | DType::F32) {
