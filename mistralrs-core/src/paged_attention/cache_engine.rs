@@ -107,20 +107,38 @@ impl PagedCacheType {
             // Fixed-precision 4-bit quantization is lossy in a way plain per-vector fidelity checks
             // don't reveal: softmax attention amplifies small per-key errors non-linearly (most
             // acutely in early layers where attention is more diffuse), and that per-layer error
-            // compounds through the residual stream. On models whose K/V vectors aren't pre-conditioned
-            // to a controlled scale (e.g. no QK-norm), this has been observed to degrade output to
-            // complete incoherence even though per-vector round-trip cosine similarity looks fine
-            // (~99.5%). No reliable signal was found to auto-detect which models are affected -- key
-            // norm variance, the natural suspect, does not cleanly separate a known-good model
-            // (Qwen3, which applies QK-norm) from a known-bad one (Qwen2.5) in practice. Warn on every
-            // use rather than silently risk this on an unverified model.
+            // compounds through the residual stream. This was first found by measuring complete
+            // output incoherence on Qwen2.5 despite ~99.5% per-vector round-trip cosine similarity --
+            // traced to Qwen2.5's high GQA ratio (query-heads-to-kv-heads) amplifying K's
+            // quantization error, which `turbo4_layer_plan`'s auto-asymmetric fallback (below) now
+            // catches automatically. That fix is ported from and empirically validated by the
+            // upstream reference (PPL 2887 -> normal at the same threshold used here), but it's a
+            // measured mitigation for one specific mechanism, not a guarantee against every way a
+            // fixed 4-bit codebook can misbehave on a model it wasn't validated against.
+            let representative_layer =
+                (0..model_config.num_layers()).find(|&i| model_config.layer_has_paged_kv_cache(i));
+            if let Some(layer_idx) = representative_layer {
+                let plan = turbo4_layer_plan(model_config, layer_idx);
+                if !plan.k_is_turbo {
+                    let num_attn_heads = model_config.num_attn_heads_for_layer(layer_idx);
+                    let num_kv_heads = model_config.num_kv_heads_for_layer(layer_idx);
+                    warn!(
+                        "Turbo4 auto-asymmetric: GQA ratio {}:1 (q_heads={num_attn_heads}, \
+                         kv_heads={num_kv_heads}) -- upgrading K from turbo4 to a plain \
+                         (unquantized) cache to prevent quality degradation. Disable with \
+                         MISTRALRS_TURBO4_AUTO_ASYMMETRIC=0.",
+                        if num_kv_heads > 0 {
+                            num_attn_heads / num_kv_heads
+                        } else {
+                            0
+                        }
+                    );
+                }
+            }
             warn!(
-                "Turbo4 KV cache uses lossy fixed-precision 4-bit quantization. It has been verified \
-                 to produce coherent output on Qwen3 (which applies QK-norm before caching K/V), but \
-                 has been observed to silently degrade output to incoherence on at least one model \
-                 without QK-norm (Qwen2.5), despite the underlying quantization looking numerically \
-                 fine in isolation. Validate output quality for your specific model before relying on \
-                 this in production; if it degrades, F8E4M3 is a safer lossy option."
+                "Turbo4 KV cache uses lossy fixed-precision 4-bit quantization. Validate output \
+                 quality for your specific model before relying on this in production; if it \
+                 degrades, F8E4M3 is a safer lossy option."
             );
             return Ok(());
         }
@@ -169,6 +187,88 @@ impl PagedCacheType {
     }
 }
 
+/// Per-layer, per-side effective Turbo4 format: either the packed 4-bit format, or a plain
+/// elementwise fallback in the model's own compute dtype (see `turbo_quant::write_plain_cache`).
+/// Two independent mitigations, both ported from the upstream reference after
+/// it turned out they're what makes Turbo4 safe to use on at least some real models in the
+/// first place (see `paged_attention.rs` module docs and the `turbo_quant` module docs):
+///
+/// - Auto-asymmetric: Turbo4's K quantization error gets amplified by the GQA broadcast factor
+///   (every query head in a group re-uses the same slightly-off key), so models with a high
+///   query-heads-to-kv-heads ratio see much worse degradation on K than on V. Upstream measured
+///   this catastrophically on Qwen2.5 (GQA ratio 7:1, PPL 2887 against a 7.4 baseline) while a
+///   lower ratio (4:1) was fine. Default-on above ratio 6, matching upstream's threshold;
+///   disable with `MISTRALRS_TURBO4_AUTO_ASYMMETRIC=0`.
+/// - Layer-adaptive: boundary layers (first/last) tend to be more sensitive to quantization
+///   noise -- attention there is often more diffuse, so softmax has less of a dominant key to
+///   fall back on when one candidate's score gets perturbed. Opt-in via
+///   `MISTRALRS_TURBO4_LAYER_ADAPTIVE` (0 = off/default, 1 = first+last 4 layers upgraded, 2 =
+///   last 8 layers upgraded), matching upstream's modes 1/2 (modes 5-7 are V-only bit-width
+///   tradeoffs between turbo2/turbo4 that don't apply to a turbo4-only port).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Turbo4LayerPlan {
+    pub k_is_turbo: bool,
+    pub v_is_turbo: bool,
+}
+
+/// GQA ratio threshold above which auto-asymmetric upgrades K, matching upstream exactly (see
+/// the measured Qwen2.5 PPL cliff in the `Turbo4LayerPlan` docs above).
+const AUTO_ASYMMETRIC_GQA_THRESHOLD: usize = 6;
+
+/// Pure arithmetic behind auto-asymmetric, split out from [`turbo4_layer_plan`] so it's testable
+/// without touching process-wide env vars (Rust tests run concurrently in one process, so two
+/// tests racing to set/unset the same env var would be flaky in a way that has nothing to do
+/// with whether this logic is correct).
+fn auto_asymmetric_upgrades_k(gqa_ratio: usize, disabled: bool) -> bool {
+    !disabled && gqa_ratio >= AUTO_ASYMMETRIC_GQA_THRESHOLD
+}
+
+/// Pure arithmetic behind layer-adaptive's boundary-layer test, split out for the same reason as
+/// [`auto_asymmetric_upgrades_k`]. Modes 5-7 (V-only turbo2/turbo4 bit-width tradeoffs) aren't
+/// modeled since this is a turbo4-only port; anything but 1 or 2 is a no-op, matching upstream's
+/// "unrecognized/off" fallthrough.
+fn layer_is_boundary(adaptive_mode: i32, layer_idx: usize, n_layer: usize) -> bool {
+    if n_layer < 8 {
+        return false;
+    }
+    match adaptive_mode {
+        1 => layer_idx < 4 || layer_idx >= n_layer - 4,
+        2 => layer_idx >= n_layer.saturating_sub(8),
+        _ => false,
+    }
+}
+
+pub(crate) fn turbo4_layer_plan(
+    model_config: &dyn ModelConfigLike,
+    layer_idx: usize,
+) -> Turbo4LayerPlan {
+    let num_attn_heads = model_config.num_attn_heads_for_layer(layer_idx);
+    let num_kv_heads = model_config.num_kv_heads_for_layer(layer_idx);
+    let gqa_ratio = if num_kv_heads > 0 {
+        num_attn_heads / num_kv_heads
+    } else {
+        1
+    };
+    let auto_asymmetric_disabled =
+        std::env::var("MISTRALRS_TURBO4_AUTO_ASYMMETRIC").ok().as_deref() == Some("0");
+    let mut k_is_turbo = !auto_asymmetric_upgrades_k(gqa_ratio, auto_asymmetric_disabled);
+    let mut v_is_turbo = true;
+
+    let adaptive_mode: i32 = std::env::var("MISTRALRS_TURBO4_LAYER_ADAPTIVE")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+    if layer_is_boundary(adaptive_mode, layer_idx, model_config.num_layers()) {
+        k_is_turbo = false;
+        v_is_turbo = false;
+    }
+
+    Turbo4LayerPlan {
+        k_is_turbo,
+        v_is_turbo,
+    }
+}
+
 impl FromStr for PagedCacheType {
     type Err = String;
     fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
@@ -212,9 +312,16 @@ impl CacheEngine {
             .cache_type
             .validate(dtype, model_config, device, &layer_devices)
             .map_err(candle_core::Error::msg)?;
+        let act_dtype = dtype;
         let dtype = cache_config.cache_type.to_dtype(dtype);
-        let gpu_cache =
-            Self::allocate_gpu_cache(model_config, cache_config, dtype, device, layer_devices)?;
+        let gpu_cache = Self::allocate_gpu_cache(
+            model_config,
+            cache_config,
+            dtype,
+            act_dtype,
+            device,
+            layer_devices,
+        )?;
         #[cfg(all(feature = "cuda", target_family = "unix"))]
         let fa3_prefill_workspaces = register_fa3_prefill_caches(&gpu_cache)?;
         #[cfg(all(feature = "cuda", target_family = "unix"))]
@@ -244,6 +351,7 @@ impl CacheEngine {
         model_config: &dyn ModelConfigLike,
         cache_config: &CacheConfig,
         dtype: DType,
+        act_dtype: DType,
         device: &Device,
         layer_devices: Vec<Option<Device>>,
     ) -> Result<Vec<KVCache>> {
@@ -266,21 +374,35 @@ impl CacheEngine {
             if cache_config.cache_type == PagedCacheType::Turbo4 {
                 // Shape validated (head_dim % GROUP == 0, Standard layout) by `validate` before
                 // `CacheEngine::new` ever calls this. `PagedAttention::forward_turbo4` reshapes
-                // this block-indexed 5D tensor to a flat (slots, ...) view to write into it.
+                // this block-indexed tensor to a flat (slots, ...) view to write into it.
                 let num_kv_heads = model_config.num_kv_heads_for_layer(layer_idx);
-                let k_groups = model_config.k_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
-                let v_groups = model_config.v_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
-                let block_shape = |groups_per_head: usize| {
+                let k_head_dim = model_config.k_head_dim_for_layer(layer_idx);
+                let v_head_dim = model_config.v_head_dim_for_layer(layer_idx);
+                let plan = turbo4_layer_plan(model_config, layer_idx);
+                let packed_shape = |head_dim: usize| {
                     (
                         num_gpu_blocks,
                         cache_config.block_size,
                         num_kv_heads,
-                        groups_per_head,
+                        head_dim / turbo_quant::GROUP,
                         turbo_quant::BLOCK_TURBO4_BYTES,
                     )
                 };
-                let key_blocks = Tensor::zeros(block_shape(k_groups), DType::U8, device)?;
-                let value_blocks = Tensor::zeros(block_shape(v_groups), DType::U8, device)?;
+                let plain_shape =
+                    |head_dim: usize| (num_gpu_blocks, cache_config.block_size, num_kv_heads, head_dim);
+                // The fallback cache is the model's own compute dtype (BF16/F16/F32), not
+                // F8E4M3 -- see write_plain_cache's docs for why (candle's CUDA backend has no
+                // generic float->F8E4M3 cast kernel to write into it with).
+                let key_blocks = if plan.k_is_turbo {
+                    Tensor::zeros(packed_shape(k_head_dim), DType::U8, device)?
+                } else {
+                    Tensor::zeros(plain_shape(k_head_dim), act_dtype, device)?
+                };
+                let value_blocks = if plan.v_is_turbo {
+                    Tensor::zeros(packed_shape(v_head_dim), DType::U8, device)?
+                } else {
+                    Tensor::zeros(plain_shape(v_head_dim), act_dtype, device)?
+                };
                 gpu_cache.push((key_blocks, value_blocks));
                 continue;
             }
@@ -801,5 +923,60 @@ mod tests {
         )?;
         assert_eq!(incompatible.fa3_prefill_num_sm_by_layer(), &[None, None]);
         Ok(())
+    }
+
+    #[test]
+    fn auto_asymmetric_upgrades_k_only_above_the_gqa_threshold() {
+        // Qwen2.5's measured-catastrophic config (see Turbo4LayerPlan docs): 4 kv heads / 28 q
+        // heads = 7:1, above the threshold, should upgrade K.
+        assert!(auto_asymmetric_upgrades_k(7, false));
+        // The threshold itself is inclusive (upstream's `gqa_ratio >= 6`).
+        assert!(auto_asymmetric_upgrades_k(6, false));
+        // Mistral's measured-fine config: 8 kv heads / 32 q heads = 4:1, below threshold.
+        assert!(!auto_asymmetric_upgrades_k(4, false));
+        assert!(!auto_asymmetric_upgrades_k(1, false));
+        // MISTRALRS_TURBO4_AUTO_ASYMMETRIC=0 disables it even above threshold.
+        assert!(!auto_asymmetric_upgrades_k(7, true));
+    }
+
+    #[test]
+    fn layer_is_boundary_matches_upstream_modes() {
+        const N: usize = 28;
+        // Mode 0 (off/default): never a boundary, regardless of layer count.
+        assert!(!layer_is_boundary(0, 0, N));
+        assert!(!layer_is_boundary(0, N - 1, N));
+        // Mode 1: first 4 + last 4 layers.
+        assert!(layer_is_boundary(1, 0, N));
+        assert!(layer_is_boundary(1, 3, N));
+        assert!(!layer_is_boundary(1, 4, N));
+        assert!(!layer_is_boundary(1, N - 5, N));
+        assert!(layer_is_boundary(1, N - 4, N));
+        assert!(layer_is_boundary(1, N - 1, N));
+        // Mode 2: last 8 layers only.
+        assert!(!layer_is_boundary(2, 0, N));
+        assert!(!layer_is_boundary(2, N - 9, N));
+        assert!(layer_is_boundary(2, N - 8, N));
+        assert!(layer_is_boundary(2, N - 1, N));
+        // Both modes are a no-op below upstream's 8-layer minimum, regardless of position.
+        assert!(!layer_is_boundary(1, 0, 4));
+        assert!(!layer_is_boundary(2, 3, 4));
+    }
+
+    #[test]
+    fn turbo4_layer_plan_matches_qwen_family_measurements() {
+        // Qwen3-8B-shaped: 32 q heads / 8 kv heads = 4:1, below threshold -- both sides stay
+        // packed. This is the config that was verified end to end against a real model.
+        let qwen3_shaped = model_config(KvCacheLayout::Standard);
+        let plan = turbo4_layer_plan(&qwen3_shaped, 0);
+        assert!(plan.k_is_turbo && plan.v_is_turbo);
+
+        // Qwen2.5-shaped: 12 q heads / 2 kv heads = 6:1, at/above threshold -- K upgrades to
+        // the plain fallback, V stays packed. This is the exact config that measured PPL 2887
+        // upstream and produced complete garbage in our own testing before this fallback existed.
+        let mut qwen2_5_shaped = model_config(KvCacheLayout::Standard);
+        qwen2_5_shaped.num_attn_heads = 12;
+        qwen2_5_shaped.num_kv_heads = 2;
+        let plan = turbo4_layer_plan(&qwen2_5_shaped, 0);
+        assert!(!plan.k_is_turbo && plan.v_is_turbo);
     }
 }

@@ -104,12 +104,19 @@ mod tests {
             PagedCacheType::F8E4M3,
             &config,
             DType::F8E4M3.size_in_bytes(),
+            DType::BF16.size_in_bytes(),
         );
         assert_eq!(f8_bytes, 4 * 2 * 8 * 128);
 
+        // GQA ratio 32/8 = 4:1 stays below the auto-asymmetric threshold, so both sides pack;
+        // act_dtype_size is irrelevant here and only matters once a side falls back.
         // Turbo4 packs 128 values into 66 bytes per (kv_head, group), one group per 128-wide head.
-        let turbo4_bytes =
-            kv_cache_bytes_per_token(PagedCacheType::Turbo4, &config, DType::U8.size_in_bytes());
+        let turbo4_bytes = kv_cache_bytes_per_token(
+            PagedCacheType::Turbo4,
+            &config,
+            DType::U8.size_in_bytes(),
+            DType::BF16.size_in_bytes(),
+        );
         assert_eq!(turbo4_bytes, 4 * 8 * (1 + 1) * 66);
 
         // Turbo4 should cost noticeably less than the naive 1-byte-per-element accounting F8E4M3
@@ -117,6 +124,29 @@ mod tests {
         // it were 8-bit and throws away roughly half of Turbo4's real memory savings.
         assert!(turbo4_bytes < f8_bytes);
         assert!((turbo4_bytes as f64 / f8_bytes as f64) < 0.6);
+    }
+
+    /// A high-GQA-ratio model (Qwen2.5-shaped: 12 q heads / 2 kv heads = 6:1) auto-upgrades K to
+    /// the plain fallback (see `turbo4_layer_plan`), which costs `act_dtype_size` bytes/element,
+    /// not the 1 byte the packed format's `dtype_size` would suggest -- sizing off the wrong one
+    /// would under- or over-allocate the cache for exactly the models this fallback protects.
+    #[test]
+    fn turbo4_bytes_per_token_accounts_for_auto_asymmetric_fallback() {
+        let mut config = model_config();
+        config.num_attn_heads = 12;
+        config.num_kv_heads = 2;
+
+        let bytes = kv_cache_bytes_per_token(
+            PagedCacheType::Turbo4,
+            &config,
+            DType::U8.size_in_bytes(),
+            DType::BF16.size_in_bytes(),
+        );
+        // Per layer: K falls back (2 kv_heads * 128 head_dim * 2 bytes/BF16-element), V stays
+        // packed (2 kv_heads * 1 group * 66 bytes), summed over 4 layers.
+        let k_fallback_bytes = 2 * 128 * 2;
+        let v_packed_bytes = 2 * 1 * 66;
+        assert_eq!(bytes, 4 * (k_fallback_bytes + v_packed_bytes));
     }
 
     #[test]
@@ -380,11 +410,15 @@ macro_rules! ctxt_to_blocks {
 /// Turbo4 packs `GROUP` (128) values into `BLOCK_TURBO4_BYTES` (66) bytes -- about 0.52
 /// bytes/element, not the 1 byte/element `DType::U8.size_in_bytes()` would naively suggest -- so
 /// billing it at the generic per-element rate would under-size the cache by roughly 2x and throw
-/// away most of the memory savings the packed format is for.
+/// away most of the memory savings the packed format is for. Each side can independently fall
+/// back to a plain elementwise layout in the model's own compute dtype instead of the packed
+/// format (see `cache_engine::turbo4_layer_plan` and `turbo_quant::write_plain_cache`'s docs for
+/// why it's the compute dtype and not F8E4M3), which needs `act_dtype_size` to size correctly.
 fn kv_cache_bytes_per_token(
     cache_type: PagedCacheType,
     config: &dyn ModelConfigLike,
     dtype_size: usize,
+    act_dtype_size: usize,
 ) -> usize {
     if cache_type != PagedCacheType::Turbo4 {
         return config.total_kv_cache_elements_per_token() * dtype_size;
@@ -395,9 +429,19 @@ fn kv_cache_bytes_per_token(
                 return None;
             }
             let heads = config.num_kv_heads_for_layer(layer_idx);
-            let k_groups = config.k_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
-            let v_groups = config.v_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
-            Some(heads * (k_groups + v_groups) * turbo_quant::BLOCK_TURBO4_BYTES)
+            let k_head_dim = config.k_head_dim_for_layer(layer_idx);
+            let v_head_dim = config.v_head_dim_for_layer(layer_idx);
+            let plan = cache_engine::turbo4_layer_plan(config, layer_idx);
+            let side_bytes = |head_dim: usize, is_turbo: bool| {
+                if is_turbo {
+                    heads * (head_dim / turbo_quant::GROUP) * turbo_quant::BLOCK_TURBO4_BYTES
+                } else {
+                    heads * head_dim * act_dtype_size
+                }
+            };
+            Some(
+                side_bytes(k_head_dim, plan.k_is_turbo) + side_bytes(v_head_dim, plan.v_is_turbo),
+            )
         })
         .sum()
 }
@@ -468,7 +512,8 @@ pub fn calculate_cache_config(
     let model_dtype = dtype;
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
-    let bytes_per_token = kv_cache_bytes_per_token(cache_type, config, dtype_size);
+    let bytes_per_token =
+        kv_cache_bytes_per_token(cache_type, config, dtype_size, model_dtype.size_in_bytes());
 
     let mut cache_devices = Vec::new();
     for layer_device in layer_devices {

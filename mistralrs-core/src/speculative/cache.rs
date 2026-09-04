@@ -290,6 +290,9 @@ impl<'a> SpeculativeCacheAccess for PagedSpeculativeCacheAccess<'a> {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: None,
+                // Turbo4 doesn't support donor-cache/speculative decoding attention at all
+                // (forward_impl bails on that combination before this would matter).
+                is_turbo4_model: false,
             }),
             flash_meta: FlashParams::empty(true),
         };

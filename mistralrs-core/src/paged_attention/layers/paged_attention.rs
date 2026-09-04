@@ -2028,12 +2028,20 @@ impl PagedAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
-    /// Eager-attention fallback for a Turbo4-quantized paged cache: writes the incoming K/V
-    /// into the packed cache via [`turbo_quant::write_turbo4_cache`], then for each sequence in
-    /// the batch gathers and dequantizes its full KV via [`turbo_quant::read_turbo4_cache`] and
+    /// Eager-attention fallback for a Turbo4-quantized paged cache: writes the incoming K/V into
+    /// the cache, then for each sequence in the batch gathers and dequantizes its full KV and
     /// runs ordinary eager attention. Correctness-first, not fused: this bypasses the native
     /// paged-attention kernels entirely (they don't understand packed sub-byte blocks), so it
     /// won't match their throughput, only their output.
+    ///
+    /// K and V are each independently either the packed Turbo4 format
+    /// ([`turbo_quant::write_turbo4_cache`]/[`turbo_quant::read_turbo4_cache`]) or a plain
+    /// elementwise fallback in the model's own compute dtype
+    /// ([`turbo_quant::write_plain_cache`]/[`turbo_quant::read_plain_cache`]), per
+    /// `cache_engine::turbo4_layer_plan`'s auto-asymmetric (high-GQA-ratio K upgrade) and
+    /// layer-adaptive (boundary-layer K+V upgrade) decisions -- both ported from the upstream
+    /// reference after it turned out those fallbacks are what makes Turbo4 safe to use on models
+    /// like Qwen2.5 in the first place (see module docs).
     fn forward_turbo4(
         &self,
         ctx: &PagedForwardCtx<'_>,
@@ -2055,16 +2063,41 @@ impl PagedAttention {
             );
         }
         let groups_per_head = head_size / turbo_quant::GROUP;
+        let key_is_turbo = key_cache.dtype() == DType::U8;
+        let value_is_turbo = value_cache.dtype() == DType::U8;
 
-        let (num_gpu_blocks, block_size, cache_kv_heads, cache_groups, cache_bytes) =
-            key_cache.dims5()?;
-        if cache_kv_heads != key_value_heads
-            || cache_groups != groups_per_head
-            || cache_bytes != turbo_quant::BLOCK_TURBO4_BYTES
-        {
+        let cache_slot_dims = |cache: &Tensor, is_turbo: bool, side: &str| -> Result<(usize, usize)> {
+            if is_turbo {
+                let (blocks, block_size, cache_kv_heads, cache_groups, cache_bytes) =
+                    cache.dims5()?;
+                if cache_kv_heads != key_value_heads
+                    || cache_groups != groups_per_head
+                    || cache_bytes != turbo_quant::BLOCK_TURBO4_BYTES
+                {
+                    candle_core::bail!(
+                        "turbo4 {side} cache shape {:?} does not match layer (kv_heads={key_value_heads}, groups_per_head={groups_per_head})",
+                        cache.dims()
+                    );
+                }
+                Ok((blocks, block_size))
+            } else {
+                let (blocks, block_size, cache_kv_heads, cache_head_dim) = cache.dims4()?;
+                if cache_kv_heads != key_value_heads || cache_head_dim != head_size {
+                    candle_core::bail!(
+                        "turbo4 {side} cache (plain fallback) shape {:?} does not match layer (kv_heads={key_value_heads}, head_size={head_size})",
+                        cache.dims()
+                    );
+                }
+                Ok((blocks, block_size))
+            }
+        };
+        let (num_gpu_blocks, block_size) = cache_slot_dims(key_cache, key_is_turbo, "key")?;
+        let value_slot_dims = cache_slot_dims(value_cache, value_is_turbo, "value")?;
+        if value_slot_dims != (num_gpu_blocks, block_size) {
             candle_core::bail!(
-                "turbo4 cache shape {:?} does not match layer (kv_heads={key_value_heads}, groups_per_head={groups_per_head})",
-                key_cache.dims()
+                "turbo4 key/value cache block layout mismatch: key={:?}, value={:?}",
+                (num_gpu_blocks, block_size),
+                value_slot_dims
             );
         }
 
@@ -2080,16 +2113,33 @@ impl PagedAttention {
         let key_tokens = reshape_kv(tensors.key)?;
         let value_tokens = reshape_kv(tensors.value)?;
 
-        let flat_shape = (
-            num_gpu_blocks * block_size,
-            key_value_heads,
-            groups_per_head,
-            turbo_quant::BLOCK_TURBO4_BYTES,
-        );
-        let flat_key_cache = key_cache.reshape(flat_shape)?;
-        let flat_value_cache = value_cache.reshape(flat_shape)?;
-        turbo_quant::write_turbo4_cache(&key_tokens, &flat_key_cache, &ctx.slot_mapping)?;
-        turbo_quant::write_turbo4_cache(&value_tokens, &flat_value_cache, &ctx.slot_mapping)?;
+        let write_side = |tokens: &Tensor, cache: &Tensor, is_turbo: bool| -> Result<()> {
+            if is_turbo {
+                let flat_cache = cache.reshape((
+                    num_gpu_blocks * block_size,
+                    key_value_heads,
+                    groups_per_head,
+                    turbo_quant::BLOCK_TURBO4_BYTES,
+                ))?;
+                turbo_quant::write_turbo4_cache(tokens, &flat_cache, &ctx.slot_mapping)
+            } else {
+                let tokens_flat =
+                    tokens.reshape((batch_size * seq_len, key_value_heads, head_size))?;
+                let flat_cache =
+                    cache.reshape((num_gpu_blocks * block_size, key_value_heads, head_size))?;
+                turbo_quant::write_plain_cache(&tokens_flat, &flat_cache, &ctx.slot_mapping)
+            }
+        };
+        // InnerQ (see turbo_quant module docs) only makes sense on the side actually going
+        // through Turbo4's fixed 4-bit quantization; the plain fallback isn't quantized at all
+        // and isn't sensitive to per-channel imbalance the same way.
+        let key_tokens_for_write = if key_is_turbo {
+            turbo_quant::innerq_scale_k(&key_tokens)?
+        } else {
+            key_tokens
+        };
+        write_side(&key_tokens_for_write, key_cache, key_is_turbo)?;
+        write_side(&value_tokens, value_cache, value_is_turbo)?;
 
         let device = tensors.query.device();
         let loc = device.location();
@@ -2100,10 +2150,36 @@ impl PagedAttention {
         })?;
         let context_lens_cpu = ctx.context_lens_cpu();
 
+        // InnerQ: once active, K got rescaled per channel above (only when K actually goes
+        // through the Turbo4 path -- the plain fallback was never scaled), so Q needs the exact
+        // inverse to keep <Q,K> unchanged. scale_inv is one GROUP-wide vector; tile it across
+        // groups_per_head to cover a >GROUP head_size.
+        let query = if key_is_turbo {
+            match turbo_quant::innerq_query_scale_inv(tensors.query.device())? {
+                Some(scale_inv) => {
+                    let tiled = if groups_per_head > 1 {
+                        scale_inv
+                            .unsqueeze(0)?
+                            .broadcast_as((groups_per_head, turbo_quant::GROUP))?
+                            .contiguous()?
+                            .reshape(head_size)?
+                    } else {
+                        scale_inv
+                    };
+                    tensors
+                        .query
+                        .broadcast_mul(&tiled.to_dtype(tensors.query.dtype())?)?
+                }
+                None => tensors.query.clone(),
+            }
+        } else {
+            tensors.query.clone()
+        };
+
         let mut outputs = Vec::with_capacity(batch_size);
         for b in 0..batch_size {
             let kv_len = context_lens_cpu.map_or(seq_len, |lens| lens[b]);
-            let q_b = tensors.query.narrow(0, b, 1)?;
+            let q_b = query.narrow(0, b, 1)?;
 
             let row = block_tables
                 .narrow(0, b, 1)?
@@ -2113,9 +2189,20 @@ impl PagedAttention {
             let blocks_needed = kv_len.div_ceil(block_size).max(1).min(row_host.len());
             let table = &row_host[..blocks_needed];
 
-            let k_seq = turbo_quant::read_turbo4_cache(key_cache, table, kv_len)?;
-            let v_seq = turbo_quant::read_turbo4_cache(value_cache, table, kv_len)?;
-            // (kv_len, kv_heads, groups_per_head, GROUP) -> (1, kv_heads, kv_len, head_size)
+            let k_seq = if key_is_turbo {
+                turbo_quant::read_turbo4_cache(key_cache, table, kv_len)?
+            } else {
+                turbo_quant::read_plain_cache(key_cache, table, kv_len)?
+            };
+            let v_seq = if value_is_turbo {
+                turbo_quant::read_turbo4_cache(value_cache, table, kv_len)?
+            } else {
+                turbo_quant::read_plain_cache(value_cache, table, kv_len)?
+            };
+            // (kv_len, kv_heads, ...) -> (1, kv_heads, kv_len, head_size). read_turbo4_cache
+            // returns (kv_len, kv_heads, groups_per_head, GROUP); read_plain_cache returns
+            // (kv_len, kv_heads, head_size). Both reshape into the same target since
+            // groups_per_head * GROUP == head_size and reshape only cares about element count.
             // dequantize_turbo4_tensor always computes/returns F32; cast back to the model's
             // compute dtype (q_b's) since attention backends require q/k/v dtypes to match.
             let reshape_seq = |t: Tensor| -> Result<Tensor> {
@@ -2163,8 +2250,13 @@ impl PagedAttention {
         flash_params: Option<&FlashParams>,
         write_cache: bool,
     ) -> Result<Tensor> {
-        let is_turbo4 = key_cache.as_ref().is_some_and(|t| t.dtype() == DType::U8)
-            || value_cache.as_ref().is_some_and(|t| t.dtype() == DType::U8);
+        // An explicit signal (threaded through PagedAttentionMeta/PagedAttentionInputMetadata),
+        // not inferred from cache tensor dtype/shape: Turbo4's per-layer/per-side
+        // auto-asymmetric and layer-adaptive fallbacks (see cache_engine::turbo4_layer_plan) can
+        // allocate a layer's K and/or V as a plain elementwise cache in the model's own compute
+        // dtype, which isn't reliably distinguishable by shape alone from a genuinely-native
+        // (non-Turbo4) cache in that same dtype.
+        let is_turbo4 = input_metadata.is_turbo4_model;
         if is_turbo4 && !write_cache {
             candle_core::bail!(
                 "Turbo4 KV cache does not yet support donor-cache (speculative decoding) attention"
@@ -2410,6 +2502,7 @@ mod tests {
         let value_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
 
         let mut input_metadata = PagedAttentionInputMetadata::dummy(&device)?;
+        input_metadata.is_turbo4_model = true;
         input_metadata.slot_mappings = HashMap::from([(
             device.location(),
             Tensor::from_vec(vec![0i64, 1, 2], (1, SEQ_LEN), &device)?,

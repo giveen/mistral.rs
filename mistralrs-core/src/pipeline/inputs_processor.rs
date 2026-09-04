@@ -304,6 +304,13 @@ pub mod text_models_inputs_processor {
         pub cu_seqlens_kv: Option<HashMap<DeviceLocation, Tensor>>,
         /// Host rows this decode metadata was built from (decode steps only).
         pub decode_rows: Option<Arc<DecodePagedRows>>,
+        /// Whether this model's paged cache is `PagedCacheType::Turbo4`. An explicit signal
+        /// rather than something `PagedAttention::forward_impl` infers from cache tensor
+        /// dtype/shape: Turbo4's per-layer/per-side auto-asymmetric and layer-adaptive fallbacks
+        /// (see `cache_engine::turbo4_layer_plan`) can allocate a layer's K and/or V as plain
+        /// F8E4M3, which is not reliably distinguishable by shape alone from a genuinely-native
+        /// `PagedCacheType::F8E4M3` cache -- so dispatch needs to know this directly, not guess.
+        pub is_turbo4_model: bool,
     }
 
     impl PagedAttentionInputMetadata {
@@ -361,6 +368,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: None,
+                is_turbo4_model: false,
             })
         }
 
@@ -613,6 +621,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: Some(cu_q_map),
                 cu_seqlens_kv: Some(cu_kv_map),
                 decode_rows: None,
+                is_turbo4_model: self.is_turbo4_model,
             })
         }
     }
@@ -1486,6 +1495,7 @@ pub mod text_models_inputs_processor {
                     None
                 },
                 decode_rows: None,
+                is_turbo4_model: paged_attn_metadata.cache_type == PagedCacheType::Turbo4,
             })
         } else {
             None
@@ -1703,6 +1713,7 @@ pub mod text_models_inputs_processor {
                 decode_window,
                 devices: mapper.unwrap().get_unique_devices(),
                 num_kv_heads: paged_attn_input.prefill_key_value_heads,
+                is_turbo4_model: paged_attn_input.cache_type == PagedCacheType::Turbo4,
             });
             Some(rows.build()?)
         } else {
@@ -1760,6 +1771,7 @@ pub mod text_models_inputs_processor {
         pub decode_window: usize,
         pub devices: Vec<Device>,
         pub num_kv_heads: usize,
+        pub is_turbo4_model: bool,
     }
 
     #[derive(Clone, Copy, Debug)]
@@ -2072,6 +2084,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: Some(self.clone()),
+                is_turbo4_model: self.is_turbo4_model,
             })
         }
 
@@ -2364,6 +2377,7 @@ pub mod text_models_inputs_processor {
                 cu_seqlens_q: None,
                 cu_seqlens_kv: None,
                 decode_rows: Some(self.clone()),
+                is_turbo4_model: self.is_turbo4_model,
             })
         }
     }
@@ -2861,6 +2875,7 @@ pub mod text_models_inputs_processor {
                 decode_window: 1,
                 devices: vec![Device::Cpu],
                 num_kv_heads: 4,
+                is_turbo4_model: false,
             })
             .build()
             .unwrap();
@@ -2888,6 +2903,7 @@ pub mod text_models_inputs_processor {
                 decode_window: 1,
                 devices: vec![Device::Cpu],
                 num_kv_heads: 4,
+                is_turbo4_model: false,
             });
             let metadata = rows
                 .build_graph_update(PagedDecodeMetadataRequirements::graph(
@@ -2923,6 +2939,7 @@ pub mod text_models_inputs_processor {
                 decode_window: 1,
                 devices: vec![Device::Cpu],
                 num_kv_heads: 4,
+                is_turbo4_model: false,
             };
             let padded = rows.padded(4);
             assert_eq!(padded.batch_size(), 4);
@@ -2963,6 +2980,7 @@ pub mod text_models_inputs_processor {
                 decode_window: 1,
                 devices: vec![Device::Cpu],
                 num_kv_heads: 1,
+                is_turbo4_model: false,
             });
 
             assert_eq!(rows.block_tables.unique_table_count(), 2);
@@ -3011,6 +3029,7 @@ pub mod text_models_inputs_processor {
                 decode_window: 1,
                 devices: vec![Device::Cpu],
                 num_kv_heads: 1,
+                is_turbo4_model: false,
             });
 
             assert_eq!(

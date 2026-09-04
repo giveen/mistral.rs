@@ -679,6 +679,7 @@ impl CudaGraphDecodeStep {
                 decode_window: rows.decode_window,
                 devices: rows.devices.clone(),
                 num_kv_heads: rows.num_kv_heads,
+                is_turbo4_model: rows.is_turbo4_model,
             }
             .padded(batch),
         );
@@ -747,6 +748,10 @@ impl CudaGraphPrecaptureInputs {
             decode_window: 1,
             devices,
             num_kv_heads: ctx.num_kv_heads,
+            // Precapture is skipped entirely for Turbo4 models (see uses_turbo4_paged_cache
+            // in normal.rs/multimodal.rs), so this fabricated warmup input is never actually
+            // dispatched through a Turbo4-aware path regardless of what's set here.
+            is_turbo4_model: false,
         });
         let metadata = rows.build_materialized().map_err(candle_core::Error::msg)?;
         let q_len_u32 = u32::try_from(q_len).map_err(candle_core::Error::wrap)?;
@@ -1522,6 +1527,7 @@ impl CudaDecodeGraphMetadataBuffers {
             cu_seqlens_q: metadata.cu_seqlens_q.clone(),
             cu_seqlens_kv: metadata.cu_seqlens_kv.clone(),
             decode_rows: metadata.decode_rows.clone(),
+            is_turbo4_model: metadata.is_turbo4_model,
         }
     }
 }
@@ -3922,6 +3928,7 @@ mod tests {
             decode_window: 1,
             devices: vec![Device::Cpu],
             num_kv_heads: 4,
+            is_turbo4_model: false,
         });
         let staged = rows.build_graph_staged().unwrap();
         let materialized = rows.build_materialized().unwrap();
@@ -3973,6 +3980,7 @@ mod tests {
             decode_window: 1,
             devices: vec![Device::Cpu],
             num_kv_heads: 4,
+            is_turbo4_model: false,
         })
         .build()
         .unwrap();
@@ -4026,6 +4034,7 @@ mod tests {
             decode_window: 1,
             devices: vec![Device::Cpu],
             num_kv_heads: 4,
+            is_turbo4_model: false,
         })
         .build_materialized()
         .unwrap();
@@ -4067,6 +4076,7 @@ mod tests {
                 decode_window: 1,
                 devices: vec![device.clone()],
                 num_kv_heads: 4,
+                is_turbo4_model: false,
             }))
         };
         let initial = rows(vec![1, 2, 3, 4], 128)?.build_materialized()?;
@@ -4525,6 +4535,7 @@ mod tests {
                 decode_window: 1,
                 devices: vec![Device::Cpu],
                 num_kv_heads: 1,
+                is_turbo4_model: false,
             }
             .padded(2),
         );
@@ -4570,6 +4581,7 @@ mod tests {
             decode_window: 1,
             devices: vec![Device::Cpu],
             num_kv_heads: 1,
+            is_turbo4_model: false,
         });
         let step = CudaGraphDecodeStep {
             input_ids: Tensor::zeros((1, 1), DType::U32, &Device::Cpu)?,
@@ -4603,6 +4615,7 @@ mod tests {
             decode_window: 1,
             devices: vec![device.clone()],
             num_kv_heads: 1,
+            is_turbo4_model: false,
         })
         .build_materialized()?;
         let initial_ids = Tensor::from_vec(vec![1u32], (1, 1), &device)?;
