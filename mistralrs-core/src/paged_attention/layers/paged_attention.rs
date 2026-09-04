@@ -2116,8 +2116,11 @@ impl PagedAttention {
             let k_seq = turbo_quant::read_turbo4_cache(key_cache, table, kv_len)?;
             let v_seq = turbo_quant::read_turbo4_cache(value_cache, table, kv_len)?;
             // (kv_len, kv_heads, groups_per_head, GROUP) -> (1, kv_heads, kv_len, head_size)
+            // dequantize_turbo4_tensor always computes/returns F32; cast back to the model's
+            // compute dtype (q_b's) since attention backends require q/k/v dtypes to match.
             let reshape_seq = |t: Tensor| -> Result<Tensor> {
-                t.reshape((1, kv_len, key_value_heads, head_size))?
+                t.to_dtype(tensors.query.dtype())?
+                    .reshape((1, kv_len, key_value_heads, head_size))?
                     .transpose(1, 2)?
                     .contiguous()
             };
@@ -2373,21 +2376,28 @@ mod tests {
         const BLOCK_SIZE: usize = 4;
         const NUM_GPU_BLOCKS: usize = 2;
 
+        // BF16, matching real model activations: dequantize_turbo4_tensor always computes/returns
+        // F32 internally, so this also exercises the cast back to the query's dtype in
+        // `forward_turbo4` (a real model run with BF16 activations used to hard-error here with
+        // "unexpected dtype, expected: BF16, got: F32" since that cast was missing).
         let query = Tensor::from_vec(
             fake_values(1, HEADS * SEQ_LEN * HEAD_SIZE),
             (1, HEADS, SEQ_LEN, HEAD_SIZE),
             &device,
-        )?;
+        )?
+        .to_dtype(DType::BF16)?;
         let key = Tensor::from_vec(
             fake_values(2, KV_HEADS * SEQ_LEN * HEAD_SIZE),
             (1, KV_HEADS, SEQ_LEN, HEAD_SIZE),
             &device,
-        )?;
+        )?
+        .to_dtype(DType::BF16)?;
         let value = Tensor::from_vec(
             fake_values(3, KV_HEADS * SEQ_LEN * HEAD_SIZE),
             (1, KV_HEADS, SEQ_LEN, HEAD_SIZE),
             &device,
-        )?;
+        )?
+        .to_dtype(DType::BF16)?;
 
         let cache_shape = (
             NUM_GPU_BLOCKS,

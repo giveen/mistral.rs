@@ -47,7 +47,9 @@ struct CudaDecodeGraphForwardInput<'a> {
 }
 use crate::kv_cache::{FullCacheManager, HybridCacheManager, NormalCacheManager};
 use crate::lora::Ordering;
-use crate::paged_attention::{calculate_cache_config, AttentionImplementation, CacheEngine};
+use crate::paged_attention::{
+    calculate_cache_config, AttentionImplementation, CacheEngine, PagedCacheType,
+};
 use crate::pipeline::chat_template::{calculate_eos_tokens, BeginEndUnkPadTok, GenerationConfig};
 #[cfg(feature = "cuda")]
 use crate::pipeline::cuda_graph::{
@@ -1756,6 +1758,18 @@ impl crate::speculative::driver::SpeculativePipelineExt for NormalPipeline {
 
 #[cfg(feature = "cuda")]
 impl NormalPipeline {
+    /// Turbo4's decode path (`PagedAttention::forward_turbo4`) does per-sequence dynamic control
+    /// flow and a device-to-host sync (reading block tables back to build the gather index), so
+    /// it cannot be captured into or replayed from a CUDA graph. Must be excluded from both
+    /// precapture and the per-step replay decision, or capture/replay either errors outright or
+    /// (during precapture) silently produces a graph that can never actually be used.
+    fn uses_turbo4_paged_cache(&self) -> bool {
+        self.metadata
+            .cache_config
+            .as_ref()
+            .is_some_and(|c| c.cache_type == PagedCacheType::Turbo4)
+    }
+
     fn try_cuda_decode_graph_forward(
         &self,
         input: CudaDecodeGraphForwardInput<'_>,
@@ -1787,6 +1801,7 @@ impl NormalPipeline {
         }
         if !self.model.supports_cuda_decode_graphs()
             || !cuda_decode_graph_supported_for_model(self.metadata.model_metadata.as_deref())
+            || self.uses_turbo4_paged_cache()
         {
             record_cuda_graph_dispatch(
                 CudaGraphComponent::Target,
@@ -1954,6 +1969,7 @@ impl NormalPipeline {
             || !self.model.supports_cuda_decode_graphs()
             || !cuda_decode_graph_supported_for_model(self.metadata.model_metadata.as_deref())
             || self.model.has_speculative_proposer()
+            || self.uses_turbo4_paged_cache()
         {
             return Ok(());
         }

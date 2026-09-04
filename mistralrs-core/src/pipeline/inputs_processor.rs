@@ -110,7 +110,7 @@ pub mod text_models_inputs_processor {
             block_aligned_sliding_window_start,
             block_hash::{noncausal_mm_ranges, MultimodalAttentionPolicy},
             block_table_rows::{BlockTableRanges, BlockTableRows, BlockTableSnapshot},
-            AttentionBackendKind, KVCacheManager, _PAD_SLOT_ID,
+            AttentionBackendKind, KVCacheManager, PagedCacheType, _PAD_SLOT_ID,
         },
         pipeline::{recurrent_batch_kind_for_input, RecurrentBatchKind},
         sequence::Sequence,
@@ -204,6 +204,10 @@ pub mod text_models_inputs_processor {
         pub block_size: usize,
         pub max_paged_context_len: usize,
         pub attention_backend: AttentionBackendKind,
+        /// Turbo4 dispatches its own host-block-table-based gather (`PagedAttention::forward_turbo4`),
+        /// bypassing the native attention_backend entirely, so decode metadata must always build real
+        /// block tables for it regardless of what `attention_backend` would otherwise suggest.
+        pub cache_type: PagedCacheType,
         pub has_flashinfer_decode_layers: bool,
         pub prefill_attention_heads: usize,
         pub prefill_key_value_heads: usize,
@@ -1692,7 +1696,8 @@ pub mod text_models_inputs_processor {
                 query_len,
                 block_size: paged_attn_input.block_size,
                 use_standard_metadata: paged_attn_input.attention_backend
-                    == AttentionBackendKind::Standard,
+                    == AttentionBackendKind::Standard
+                    || paged_attn_input.cache_type == PagedCacheType::Turbo4,
                 max_paged_context_len: paged_attn_input.max_paged_context_len,
                 sliding_window: paged_attn_input.sliding_window,
                 decode_window,

@@ -1878,6 +1878,11 @@ impl Engine {
                                         .unwrap_or(
                                             crate::paged_attention::AttentionBackendKind::Standard,
                                         ),
+                                    cache_type: pipeline_metadata
+                                        .cache_config
+                                        .as_ref()
+                                        .map(|cache_config| cache_config.cache_type)
+                                        .unwrap_or_default(),
                                     has_flashinfer_decode_layers: model_metadata
                                         .is_some_and(|metadata| {
                                             (0..metadata.num_layers()).any(|layer_idx| {

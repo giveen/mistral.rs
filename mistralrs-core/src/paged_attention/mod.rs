@@ -76,9 +76,48 @@ pub(crate) fn block_aligned_sliding_window_start(
 #[cfg(test)]
 mod tests {
     use super::{
-        block_aligned_sliding_window_start, fit_post_load_cache_budget, MemoryGpuConfig,
-        PagedAttentionConfig, PagedCacheType,
+        block_aligned_sliding_window_start, fit_post_load_cache_budget, kv_cache_bytes_per_token,
+        MemoryGpuConfig, PagedAttentionConfig, PagedCacheType,
     };
+    use crate::paged_attention::config::{KvCacheLayout, ModelConfigMetadata};
+    use candle_core::DType;
+
+    fn model_config() -> ModelConfigMetadata {
+        ModelConfigMetadata {
+            max_seq_len: 4096,
+            num_layers: 4,
+            hidden_size: 1024,
+            num_kv_heads: 8,
+            num_attn_heads: 32,
+            sliding_window: None,
+            k_head_dim: 128,
+            v_head_dim: 128,
+            kv_cache_layout: KvCacheLayout::Standard,
+        }
+    }
+
+    #[test]
+    fn turbo4_bytes_per_token_reflects_packed_size_not_dtype_size() {
+        let config = model_config();
+        // F8E4M3 (1 byte/element): bytes/token = layers * 2 * kv_heads * head_dim * 1.
+        let f8_bytes = kv_cache_bytes_per_token(
+            PagedCacheType::F8E4M3,
+            &config,
+            DType::F8E4M3.size_in_bytes(),
+        );
+        assert_eq!(f8_bytes, 4 * 2 * 8 * 128);
+
+        // Turbo4 packs 128 values into 66 bytes per (kv_head, group), one group per 128-wide head.
+        let turbo4_bytes =
+            kv_cache_bytes_per_token(PagedCacheType::Turbo4, &config, DType::U8.size_in_bytes());
+        assert_eq!(turbo4_bytes, 4 * 8 * (1 + 1) * 66);
+
+        // Turbo4 should cost noticeably less than the naive 1-byte-per-element accounting F8E4M3
+        // already uses -- if this regresses to `elements_per_token * 1`, the cache is sized as if
+        // it were 8-bit and throws away roughly half of Turbo4's real memory savings.
+        assert!(turbo4_bytes < f8_bytes);
+        assert!((turbo4_bytes as f64 / f8_bytes as f64) < 0.6);
+    }
 
     #[test]
     fn sliding_window_retains_prior_window_and_whole_query() {
@@ -324,15 +363,43 @@ fn trim_cuda_mempool(device: &Device) -> candle_core::Result<()> {
 const SIZE_IN_MB: usize = 1024 * 1024;
 
 macro_rules! mb_to_blocks {
-    ($mb_size:expr, $dtype_size:expr, $block_size:expr, $config:expr) => {
-        $mb_size / $dtype_size / $block_size / $config.total_kv_cache_elements_per_token()
+    ($mb_size:expr, $bytes_per_token:expr, $block_size:expr) => {
+        $mb_size / $bytes_per_token / $block_size
     };
 }
 
 macro_rules! ctxt_to_blocks {
-    ($context_len:expr, $dtype_size:expr, $block_size:expr, $config:expr) => {
-        $context_len * $dtype_size * $config.total_kv_cache_elements_per_token()
+    ($context_len:expr, $bytes_per_token:expr) => {
+        $context_len * $bytes_per_token
     };
+}
+
+/// Actual KV cache bytes per token, summed over every layer holding a paged cache.
+///
+/// For element-wise dtypes (f32/f16/bf16/f8e4m3) this is just `elements_per_token * dtype_size`.
+/// Turbo4 packs `GROUP` (128) values into `BLOCK_TURBO4_BYTES` (66) bytes -- about 0.52
+/// bytes/element, not the 1 byte/element `DType::U8.size_in_bytes()` would naively suggest -- so
+/// billing it at the generic per-element rate would under-size the cache by roughly 2x and throw
+/// away most of the memory savings the packed format is for.
+fn kv_cache_bytes_per_token(
+    cache_type: PagedCacheType,
+    config: &dyn ModelConfigLike,
+    dtype_size: usize,
+) -> usize {
+    if cache_type != PagedCacheType::Turbo4 {
+        return config.total_kv_cache_elements_per_token() * dtype_size;
+    }
+    (0..config.num_layers())
+        .filter_map(|layer_idx| {
+            if !config.layer_has_paged_kv_cache(layer_idx) {
+                return None;
+            }
+            let heads = config.num_kv_heads_for_layer(layer_idx);
+            let k_groups = config.k_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
+            let v_groups = config.v_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
+            Some(heads * (k_groups + v_groups) * turbo_quant::BLOCK_TURBO4_BYTES)
+        })
+        .sum()
 }
 
 fn fit_post_load_cache_budget(
@@ -401,6 +468,7 @@ pub fn calculate_cache_config(
     let model_dtype = dtype;
     let dtype = cache_type.to_dtype(dtype);
     let dtype_size = dtype.size_in_bytes();
+    let bytes_per_token = kv_cache_bytes_per_token(cache_type, config, dtype_size);
 
     let mut cache_devices = Vec::new();
     for layer_device in layer_devices {
@@ -493,7 +561,7 @@ pub fn calculate_cache_config(
             }
             MemoryGpuConfig::ContextSize(toks) => {
                 // ContextSize is demand-driven (bytes needed for N tokens), not a memory budget, so model weight does not apply here.
-                ctxt_to_blocks!(toks, dtype_size, block_size, config).div_ceil(SIZE_IN_MB)
+                ctxt_to_blocks!(toks, bytes_per_token).div_ceil(SIZE_IN_MB)
             }
         };
         if let Some(memory) = post_load_memory {
@@ -526,8 +594,7 @@ pub fn calculate_cache_config(
     let mut mem_gpu = min_mem_gpu;
     if device.is_metal() {
         let max_tokens = max_num_tokens.unwrap_or(config.max_seq_len());
-        let mem_for_tokens =
-            ctxt_to_blocks!(max_tokens, dtype_size, block_size, config) / SIZE_IN_MB;
+        let mem_for_tokens = ctxt_to_blocks!(max_tokens, bytes_per_token) / SIZE_IN_MB;
         if mem_for_tokens < mem_gpu {
             if !silent {
                 info!(
@@ -539,7 +606,7 @@ pub fn calculate_cache_config(
         }
     }
 
-    let num_gpu_blocks = mb_to_blocks!(mem_gpu * SIZE_IN_MB, dtype_size, block_size, config);
+    let num_gpu_blocks = mb_to_blocks!(mem_gpu * SIZE_IN_MB, bytes_per_token, block_size);
     if num_gpu_blocks == 0 {
         anyhow::bail!("Num GPU blocks is 0. This means there is not enough memory. Either reduce the memory amount/utilization/context size or disable PagedAttention.");
     }
