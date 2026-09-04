@@ -313,6 +313,31 @@ extern "C" {
         dtype: u32,
     );
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn paged_attention_turbo4(
+        out: *const c_void,
+        query: *const c_void,
+        key_cache_turbo: *const c_void,
+        key_cache_plain: *const c_void,
+        value_cache_turbo: *const c_void,
+        value_cache_plain: *const c_void,
+        key_is_turbo: c_int,
+        value_is_turbo: c_int,
+        block_table: *const c_int,
+        context_lens: *const c_int,
+        num_seqs: c_int,
+        num_heads: c_int,
+        num_kv_heads: c_int,
+        head_size: c_int,
+        groups_per_head: c_int,
+        block_size: c_int,
+        max_num_blocks_per_seq: c_int,
+        scale: f32,
+        softcapping: f32,
+        stream: CUstream,
+        io_dtype: u32,
+    );
+
     pub fn paged_attention_v1_f16(
         out: *const c_void,
         query: *const c_void,

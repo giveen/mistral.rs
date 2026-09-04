@@ -2062,6 +2062,65 @@ impl PagedAttention {
     /// rows can actually diverge.
     #[cfg(all(feature = "cuda", target_family = "unix"))]
     #[allow(clippy::too_many_arguments)]
+    /// Attempts the fused Turbo4 paged-attention kernel (rotate Q once, run the whole
+    /// KQ/softmax/weighted-V loop directly against the cache, inverse-rotate the output once --
+    /// see `paged_attention_turbo4_kernel.cu`'s module doc). Decode-only (`seq_len == 1`,
+    /// mirroring the native `paged_attention_v1/v2` kernels this is modeled on) and bounded by
+    /// `MAX_FUSED_DECODE_CONTEXT_TOKENS`; returns `Ok(None)` for anything outside that scope so
+    /// the caller falls back to [`Self::forward_turbo4_batched_gather`], which has no such
+    /// limits. `context_lens`/`block_tables` are read as GPU tensors with no host sync, so this
+    /// (unlike the batched-gather fallback) is safe to call from inside a captured CUDA graph.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_turbo4_fused_decode(
+        &self,
+        ctx: &PagedForwardCtx<'_>,
+        tensors: PagedForwardTensors<'_>,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+        query: &Tensor,
+        block_tables: &Tensor,
+        block_size: usize,
+    ) -> Result<Option<Tensor>> {
+        let PagedForwardDims {
+            batch_size,
+            seq_len,
+            attention_heads,
+            head_size,
+            ..
+        } = ctx.dims;
+        if seq_len != 1
+            || matches!(tensors.attention_mask, AttentionMask::Custom(_))
+            || ctx.sdpa_params.sinks.is_some()
+        {
+            return Ok(None);
+        }
+        let device = query.device();
+        let loc = device.location();
+        let Some(context_lens) = ctx.context_lens(&loc) else {
+            return Ok(None);
+        };
+        let (_, max_num_blocks_per_seq) = block_tables.dims2()?;
+        if max_num_blocks_per_seq * block_size > mistralrs_paged_attn::MAX_FUSED_DECODE_CONTEXT_TOKENS
+        {
+            return Ok(None);
+        }
+
+        let query_3d = query.reshape((batch_size, attention_heads, head_size))?;
+        let block_tables_u32 = block_tables.to_dtype(DType::U32)?;
+        let context_lens_u32 = context_lens.to_dtype(DType::U32)?;
+        let out = mistralrs_paged_attn::paged_attention_turbo4(
+            &query_3d,
+            key_cache,
+            value_cache,
+            &block_tables_u32,
+            &context_lens_u32,
+            ctx.sdpa_params.softmax_scale,
+            ctx.sdpa_params.softcap.unwrap_or(1.0),
+        )?;
+        Ok(Some(out.reshape((batch_size, attention_heads, 1, head_size))?))
+    }
+
     fn forward_turbo4_batched_gather(
         &self,
         ctx: &PagedForwardCtx<'_>,
@@ -2299,6 +2358,21 @@ impl PagedAttention {
         } else {
             tensors.query.clone()
         };
+
+        #[cfg(all(feature = "cuda", target_family = "unix"))]
+        if device.is_cuda() {
+            if let Some(out) = self.forward_turbo4_fused_decode(
+                ctx,
+                tensors,
+                key_cache,
+                value_cache,
+                &query,
+                block_tables,
+                block_size,
+            )? {
+                return Ok(out);
+            }
+        }
 
         #[cfg(all(feature = "cuda", target_family = "unix"))]
         if device.is_cuda()
@@ -2799,6 +2873,151 @@ mod tests {
         assert!(
             sim > 0.9,
             "turbo4 attention with a Custom mask diverged too much: cosine={sim}"
+        );
+        Ok(())
+    }
+
+    /// Exercises `forward_turbo4_fused_decode` specifically: a prefill writes 4 tokens through
+    /// the normal path (populating the cache), then a decode step with `seq_len == 1` and
+    /// `context_lens` set as a *device* tensor (not just `paged_context_lens_cpu`) attends over
+    /// all 5 cached tokens. Compares against running the same attention directly on the
+    /// un-quantized 5-token K/V (prefill K/V concatenated with the decode step's own new K/V).
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    #[allow(clippy::cast_precision_loss)]
+    fn turbo4_fused_decode_matches_direct_attention_closely_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        const HEADS: usize = 2;
+        const KV_HEADS: usize = 2;
+        const PREFILL_LEN: usize = 4;
+        const HEAD_SIZE: usize = turbo_quant::GROUP;
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 4;
+
+        let query1 = Tensor::from_vec(
+            fake_values(21, HEADS * PREFILL_LEN * HEAD_SIZE),
+            (1, HEADS, PREFILL_LEN, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let key1 = Tensor::from_vec(
+            fake_values(22, KV_HEADS * PREFILL_LEN * HEAD_SIZE),
+            (1, KV_HEADS, PREFILL_LEN, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let value1 = Tensor::from_vec(
+            fake_values(23, KV_HEADS * PREFILL_LEN * HEAD_SIZE),
+            (1, KV_HEADS, PREFILL_LEN, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+
+        let cache_shape = (
+            NUM_GPU_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            1,
+            turbo_quant::BLOCK_TURBO4_BYTES,
+        );
+        let key_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
+        let value_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
+
+        let mut input_metadata1 = PagedAttentionInputMetadata::dummy(&device)?;
+        input_metadata1.is_turbo4_model = true;
+        input_metadata1.slot_mappings = HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0i64, 1, 2, 3], (1, PREFILL_LEN), &device)?,
+        )]);
+        input_metadata1.block_tables = Some(HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0u32, 1], (1, 2), &device)?,
+        )]));
+        input_metadata1.paged_context_lens_cpu = Some(vec![PREFILL_LEN]);
+
+        let sdpa_params = SdpaParams {
+            n_kv_groups: HEADS / KV_HEADS,
+            softcap: None,
+            softmax_scale: 1.0 / (HEAD_SIZE as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        let mask = AttentionMask::None;
+
+        let pa = PagedAttention::new(HEAD_SIZE, &device, None)?;
+        pa.forward(
+            &query1,
+            &key1,
+            &value1,
+            &mask,
+            Some(key_cache.clone()),
+            Some(value_cache.clone()),
+            &input_metadata1,
+            &sdpa_params,
+            None,
+        )?;
+
+        const TOTAL_LEN: usize = PREFILL_LEN + 1;
+        let query2 = Tensor::from_vec(
+            fake_values(24, HEADS * HEAD_SIZE),
+            (1, HEADS, 1, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let key2 = Tensor::from_vec(
+            fake_values(25, KV_HEADS * HEAD_SIZE),
+            (1, KV_HEADS, 1, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+        let value2 = Tensor::from_vec(
+            fake_values(26, KV_HEADS * HEAD_SIZE),
+            (1, KV_HEADS, 1, HEAD_SIZE),
+            &device,
+        )?
+        .to_dtype(DType::BF16)?;
+
+        let mut input_metadata2 = PagedAttentionInputMetadata::dummy(&device)?;
+        input_metadata2.is_turbo4_model = true;
+        input_metadata2.is_first_prompt_chunk = false;
+        input_metadata2.slot_mappings = HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![PREFILL_LEN as i64], (1, 1), &device)?,
+        )]);
+        input_metadata2.block_tables = Some(HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0u32, 1], (1, 2), &device)?,
+        )]));
+        input_metadata2.paged_context_lens_cpu = Some(vec![TOTAL_LEN]);
+        input_metadata2.context_lens = Some(HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![TOTAL_LEN as u32], (1,), &device)?,
+        )]));
+
+        let turbo_out2 = pa.forward(
+            &query2,
+            &key2,
+            &value2,
+            &mask,
+            Some(key_cache),
+            Some(value_cache),
+            &input_metadata2,
+            &sdpa_params,
+            None,
+        )?;
+
+        let full_key = Tensor::cat(&[&key1, &key2], 2)?;
+        let full_value = Tensor::cat(&[&value1, &value2], 2)?;
+        let reference_out =
+            Sdpa.run_attention(&query2, &full_key, &full_value, &mask, None, &sdpa_params)?;
+
+        assert_eq!(turbo_out2.dims(), reference_out.dims());
+        let sim = cosine_similarity(&turbo_out2, &reference_out)?;
+        assert!(
+            sim > 0.9,
+            "fused turbo4 decode output diverged too much: cosine={sim}"
         );
         Ok(())
     }

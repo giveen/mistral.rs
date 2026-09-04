@@ -7,6 +7,7 @@ mod gather_kv;
 mod gather_turbo4;
 mod mla;
 mod paged_attention;
+mod paged_attention_turbo4;
 mod scale_update;
 pub use cache::{copy_blocks, swap_blocks};
 use candle_core::cuda::cudarc::{
@@ -32,6 +33,7 @@ pub use gather_turbo4::{
 };
 pub use mla::{concat_and_cache_mla, flashinfer_mla_decode, gather_mla_cache};
 pub use paged_attention::{paged_attention, reshape_and_cache};
+pub use paged_attention_turbo4::{paged_attention_turbo4, MAX_FUSED_DECODE_CONTEXT_TOKENS};
 pub use scale_update::kv_scale_update;
 
 fn cache_input_layout(
