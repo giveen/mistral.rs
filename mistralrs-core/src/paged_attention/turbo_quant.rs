@@ -1064,6 +1064,170 @@ mod tests {
         Ok(())
     }
 
+    /// Validates the `_into` gather variants (`gather_turbo4_cache_into`,
+    /// `gather_plain_kv_cache_into`) against their allocating counterparts, using exactly the
+    /// pattern a future CUDA-graph-persistent buffer would: one `out` tensor sized larger than
+    /// any single call's `num_tokens` ("bucket max"), written into repeatedly across calls with
+    /// different `num_tokens` and different underlying data ("replays"). Checks both that the
+    /// valid rows match the allocating reference each time, and that rows beyond `num_tokens`
+    /// are left untouched rather than zeroed or otherwise disturbed -- a graph replay with a
+    /// shorter batch than a prior one depends on stale trailing rows never being read downstream,
+    /// not on the kernel clearing them, so this pins down that the kernel really does only ever
+    /// touch `out[0..num_tokens]`.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    fn gather_into_variants_only_touch_the_requested_rows() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        const NUM_BLOCKS: usize = 4;
+        const BLOCK_SIZE: usize = 2;
+        const KV_HEADS: usize = 1;
+        const GROUPS_PER_HEAD: usize = 1;
+        const BUCKET_MAX_TOKENS: usize = 6;
+
+        // Turbo4-packed side. write_turbo4_cache takes the flat slot-indexed shape;
+        // gather_turbo4_cache(_into) takes the block-indexed 5D view of that same storage.
+        let turbo_cache_flat = Tensor::zeros(
+            (
+                NUM_BLOCKS * BLOCK_SIZE,
+                KV_HEADS,
+                GROUPS_PER_HEAD,
+                BLOCK_TURBO4_BYTES,
+            ),
+            DType::U8,
+            &device,
+        )?;
+        let turbo_tokens: Vec<[f32; GROUP]> = [3, 9, 27].iter().map(|&s| test_vector(s)).collect();
+        let turbo_flat: Vec<f32> = turbo_tokens.iter().flatten().copied().collect();
+        let turbo_x = Tensor::from_slice(&turbo_flat, (3, KV_HEADS, GROUPS_PER_HEAD, GROUP), &device)?;
+        write_turbo4_cache(&turbo_x, &turbo_cache_flat, &Tensor::new(&[0i64, 1, 2], &device)?)?;
+        let turbo_cache = turbo_cache_flat.reshape((
+            NUM_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            GROUPS_PER_HEAD,
+            BLOCK_TURBO4_BYTES,
+        ))?;
+
+        // Sentinel fill so "untouched" is verifiable (not coincidentally zero).
+        let sentinel = -777.0f32;
+        let turbo_out = Tensor::full(sentinel, (BUCKET_MAX_TOKENS, KV_HEADS, GROUP), &device)?;
+
+        for (num_tokens, block_table, cu_seq_lens) in [
+            (2usize, [0u32, 0], [0i32, 2]),
+            (1usize, [0u32, 0], [0i32, 1]),
+        ] {
+            let block_table_t = Tensor::from_slice(&block_table, (1, 2), &device)?;
+            let cu_seq_lens_t = Tensor::from_slice(&cu_seq_lens, (2,), &device)?;
+            // Snapshot the trailing region *before* this call: on the second call, rows
+            // beyond num_tokens still hold real data the first call wrote (not the original
+            // sentinel), and "untouched" means "unchanged by this call", not "still sentinel".
+            let before: Vec<f32> = turbo_out
+                .narrow(0, num_tokens, BUCKET_MAX_TOKENS - num_tokens)?
+                .flatten_all()?
+                .to_vec1()?;
+            mistralrs_paged_attn::gather_turbo4_cache_into(
+                &turbo_cache,
+                &block_table_t,
+                &cu_seq_lens_t,
+                num_tokens,
+                &turbo_out,
+            )?;
+            let reference = mistralrs_paged_attn::gather_turbo4_cache(
+                &turbo_cache,
+                &block_table_t,
+                &cu_seq_lens_t,
+                num_tokens,
+                DType::F32,
+            )?;
+            let got_vals: Vec<f32> = turbo_out
+                .narrow(0, 0, num_tokens)?
+                .reshape(num_tokens * GROUP)?
+                .to_vec1()?;
+            let ref_vals: Vec<f32> = reference.reshape(num_tokens * GROUP)?.to_vec1()?;
+            for (g, r) in got_vals.iter().zip(ref_vals.iter()) {
+                assert!(
+                    (g - r).abs() < 1e-3,
+                    "turbo4 _into vs allocating mismatch at num_tokens={num_tokens}: {g} vs {r}"
+                );
+            }
+            let after: Vec<f32> = turbo_out
+                .narrow(0, num_tokens, BUCKET_MAX_TOKENS - num_tokens)?
+                .flatten_all()?
+                .to_vec1()?;
+            assert_eq!(
+                before, after,
+                "turbo4 _into wrote past num_tokens={num_tokens} into rows it shouldn't have touched"
+            );
+        }
+
+        // Plain fallback side, same shape of check. write_plain_cache takes the flat
+        // slot-indexed shape; gather_plain_kv_cache(_into) takes the block-indexed 4D view.
+        let plain_cache_flat =
+            Tensor::zeros((NUM_BLOCKS * BLOCK_SIZE, KV_HEADS, GROUP), DType::BF16, &device)?;
+        let plain_tokens: Vec<[f32; GROUP]> = [4, 10, 28].iter().map(|&s| test_vector(s)).collect();
+        let plain_flat: Vec<f32> = plain_tokens.iter().flatten().copied().collect();
+        let plain_x = Tensor::from_slice(&plain_flat, (3, KV_HEADS, GROUP), &device)?;
+        write_plain_cache(&plain_x, &plain_cache_flat, &Tensor::new(&[0i64, 1, 2], &device)?)?;
+        let plain_cache = plain_cache_flat.reshape((NUM_BLOCKS, BLOCK_SIZE, KV_HEADS, GROUP))?;
+
+        let plain_out = Tensor::full(
+            half::bf16::from_f32(sentinel),
+            (BUCKET_MAX_TOKENS, KV_HEADS, GROUP),
+            &device,
+        )?;
+
+        for (num_tokens, block_table, cu_seq_lens) in [
+            (2usize, [0u32, 0], [0i32, 2]),
+            (1usize, [0u32, 0], [0i32, 1]),
+        ] {
+            let block_table_t = Tensor::from_slice(&block_table, (1, 2), &device)?;
+            let cu_seq_lens_t = Tensor::from_slice(&cu_seq_lens, (2,), &device)?;
+            let before: Vec<f32> = plain_out
+                .narrow(0, num_tokens, BUCKET_MAX_TOKENS - num_tokens)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            mistralrs_paged_attn::gather_plain_kv_cache_into(
+                &plain_cache,
+                &block_table_t,
+                &cu_seq_lens_t,
+                num_tokens,
+                &plain_out,
+            )?;
+            let reference = mistralrs_paged_attn::gather_plain_kv_cache(
+                &plain_cache,
+                &block_table_t,
+                &cu_seq_lens_t,
+                num_tokens,
+            )?
+            .to_dtype(DType::F32)?;
+            let got_vals: Vec<f32> = plain_out
+                .narrow(0, 0, num_tokens)?
+                .to_dtype(DType::F32)?
+                .reshape(num_tokens * GROUP)?
+                .to_vec1()?;
+            let ref_vals: Vec<f32> = reference.reshape(num_tokens * GROUP)?.to_vec1()?;
+            for (g, r) in got_vals.iter().zip(ref_vals.iter()) {
+                assert!(
+                    (g - r).abs() < 1e-2,
+                    "plain _into vs allocating mismatch at num_tokens={num_tokens}: {g} vs {r}"
+                );
+            }
+            let after: Vec<f32> = plain_out
+                .narrow(0, num_tokens, BUCKET_MAX_TOKENS - num_tokens)?
+                .to_dtype(DType::F32)?
+                .flatten_all()?
+                .to_vec1()?;
+            assert_eq!(
+                before, after,
+                "plain _into wrote past num_tokens={num_tokens} into rows it shouldn't have touched"
+            );
+        }
+        Ok(())
+    }
+
     /// The plain elementwise fallback (`turbo4_layer_plan`'s auto-asymmetric/layer-adaptive
     /// escape hatch): no WHT rotation or centroid quantization, just a cast into the cache's own
     /// dtype, so recovered values should match far more tightly than the 4-bit round trip above.

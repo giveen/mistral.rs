@@ -26,7 +26,10 @@ pub use flashinfer::{
     reshape_and_cache_flashinfer, FlashInferDecodeScratch,
 };
 pub use gather_kv::gather_kv_cache;
-pub use gather_turbo4::{gather_plain_kv_cache, gather_turbo4_cache, write_turbo4_cache};
+pub use gather_turbo4::{
+    gather_plain_kv_cache, gather_plain_kv_cache_into, gather_turbo4_cache,
+    gather_turbo4_cache_into, write_turbo4_cache,
+};
 pub use mla::{concat_and_cache_mla, flashinfer_mla_decode, gather_mla_cache};
 pub use paged_attention::{paged_attention, reshape_and_cache};
 pub use scale_update::kv_scale_update;

@@ -38,7 +38,6 @@ fn validate_block_table_and_cu_seq_lens(block_table: &Tensor, cu_seq_lens: &Tens
 /// kernel, and `block_table`/`cu_seq_lens` are read as GPU tensors, so this
 /// call has no host readback (unlike the eager per-row Rust path this
 /// replaces, which pulled the block table to the host per batch row).
-#[allow(clippy::too_many_arguments)]
 pub fn gather_turbo4_cache(
     cache: &Tensor,       // [num_blocks, block_size, kv_heads, groups_per_head, BLOCK_TURBO4_BYTES]
     block_table: &Tensor, // [batch, max_blocks]
@@ -46,6 +45,29 @@ pub fn gather_turbo4_cache(
     num_tokens: usize,    // cu_seq_lens[-1]
     out_dtype: DType,
 ) -> Result<Tensor> {
+    let (_num_blocks, _block_size, kv_heads, groups_per_head, _block_bytes) = cache.dims5()?;
+    let head_size = groups_per_head * TURBO4_GROUP;
+    if num_tokens == 0 {
+        return Tensor::zeros((0, kv_heads, head_size), out_dtype, cache.device());
+    }
+    let out = Tensor::zeros((num_tokens, kv_heads, head_size), out_dtype, cache.device())?;
+    gather_turbo4_cache_into(cache, block_table, cu_seq_lens, num_tokens, &out)?;
+    Ok(out)
+}
+
+/// Same as [`gather_turbo4_cache`] but writes into a caller-provided `out` instead of
+/// allocating a fresh tensor. `out`'s row count only needs to be `>= num_tokens`: the kernel's
+/// grid is sized by `num_tokens` alone, so rows beyond it are left untouched -- this is what
+/// makes the function usable against a CUDA-graph-persistent buffer sized to a batch bucket's
+/// max token count, where the same buffer is reused (rows beyond the current replay's actual
+/// `num_tokens` just keep stale data from a prior replay, which downstream code must not read).
+pub fn gather_turbo4_cache_into(
+    cache: &Tensor,
+    block_table: &Tensor,
+    cu_seq_lens: &Tensor,
+    num_tokens: usize,
+    out: &Tensor,
+) -> Result<()> {
     if cache.dtype() != DType::U8 {
         candle_core::bail!(
             "gather_turbo4_cache expects a u8 packed cache, got {:?}",
@@ -63,6 +85,15 @@ pub fn gather_turbo4_cache(
         );
     }
     let head_size = groups_per_head * TURBO4_GROUP;
+    let out_dtype = out.dtype();
+    let out_dtype_code = out_dtype_code(out_dtype, "gather_turbo4_cache")?;
+    let (out_rows, out_kv_heads, out_head_size) = out.dims3()?;
+    if out_rows < num_tokens || out_kv_heads != kv_heads || out_head_size != head_size {
+        candle_core::bail!(
+            "gather_turbo4_cache: out shape {:?} cannot hold {num_tokens} tokens of (kv_heads={kv_heads}, head_size={head_size})",
+            out.dims()
+        );
+    }
 
     let cu_seq_lens_len = cu_seq_lens.dims1()?;
     let num_seqs = cu_seq_lens_len
@@ -73,74 +104,68 @@ pub fn gather_turbo4_cache(
     let num_seqs_i32 = i32::try_from(num_seqs)
         .map_err(|_| candle_core::Error::msg("num_seqs exceeds the kernel i32 limit"))?;
 
-    let out_dtype_code = out_dtype_code(out_dtype, "gather_turbo4_cache")?;
-
     if num_tokens == 0 {
-        return Tensor::zeros((0, kv_heads, head_size), out_dtype, cache.device());
+        return Ok(());
     }
 
-    let out = Tensor::zeros((num_tokens, kv_heads, head_size), out_dtype, cache.device())?;
+    let (c_s, c_l) = cache.storage_and_layout();
+    let c_s = match &*c_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cache must be a cuda tensor"),
+    };
+    let (c_ptr, _c_guard) = slice_ptr(c_s.as_cuda_slice::<u8>()?, c_l.start_offset());
 
-    {
-        let (c_s, c_l) = cache.storage_and_layout();
-        let c_s = match &*c_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("cache must be a cuda tensor"),
-        };
-        let (c_ptr, _c_guard) = slice_ptr(c_s.as_cuda_slice::<u8>()?, c_l.start_offset());
+    let (o_s, o_l) = out.storage_and_layout();
+    let o_s = match &*o_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("out must be a cuda tensor"),
+    };
+    let (o_ptr, _o_guard) = match out_dtype {
+        DType::F16 => slice_ptr(o_s.as_cuda_slice::<half::f16>()?, o_l.start_offset()),
+        DType::BF16 => slice_ptr(o_s.as_cuda_slice::<half::bf16>()?, o_l.start_offset()),
+        DType::F32 => slice_ptr(o_s.as_cuda_slice::<f32>()?, o_l.start_offset()),
+        _ => unreachable!(),
+    };
 
-        let (o_s, o_l) = out.storage_and_layout();
-        let o_s = match &*o_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("out must be a cuda tensor"),
-        };
-        let (o_ptr, _o_guard) = match out_dtype {
-            DType::F16 => slice_ptr(o_s.as_cuda_slice::<half::f16>()?, o_l.start_offset()),
-            DType::BF16 => slice_ptr(o_s.as_cuda_slice::<half::bf16>()?, o_l.start_offset()),
-            DType::F32 => slice_ptr(o_s.as_cuda_slice::<f32>()?, o_l.start_offset()),
-            _ => unreachable!(),
-        };
+    let (bt_s, bt_l) = block_table.storage_and_layout();
+    let bt_s = match &*bt_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("block_table must be a cuda tensor"),
+    };
+    let (bt_ptr, _bt_guard) = slice_ptr(bt_s.as_cuda_slice::<u32>()?, bt_l.start_offset());
 
-        let (bt_s, bt_l) = block_table.storage_and_layout();
-        let bt_s = match &*bt_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("block_table must be a cuda tensor"),
-        };
-        let (bt_ptr, _bt_guard) = slice_ptr(bt_s.as_cuda_slice::<u32>()?, bt_l.start_offset());
+    let (cu_s, cu_l) = cu_seq_lens.storage_and_layout();
+    let cu_s = match &*cu_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cu_seq_lens must be a cuda tensor"),
+    };
+    let (cu_ptr, _cu_guard) = if cu_seq_lens.dtype() == DType::I32 {
+        slice_ptr(cu_s.as_cuda_slice::<i32>()?, cu_l.start_offset())
+    } else {
+        slice_ptr(cu_s.as_cuda_slice::<u32>()?, cu_l.start_offset())
+    };
 
-        let (cu_s, cu_l) = cu_seq_lens.storage_and_layout();
-        let cu_s = match &*cu_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("cu_seq_lens must be a cuda tensor"),
-        };
-        let (cu_ptr, _cu_guard) = if cu_seq_lens.dtype() == DType::I32 {
-            slice_ptr(cu_s.as_cuda_slice::<i32>()?, cu_l.start_offset())
-        } else {
-            slice_ptr(cu_s.as_cuda_slice::<u32>()?, cu_l.start_offset())
-        };
+    let (_, block_table_stride) = bt_l.shape().dims2()?;
+    let dev = c_s.device();
 
-        let (_, block_table_stride) = bt_l.shape().dims2()?;
-        let dev = c_s.device();
-
-        unsafe {
-            ffi_gather_turbo4_cache(
-                c_ptr as *const core::ffi::c_void,
-                o_ptr as *const core::ffi::c_void,
-                bt_ptr as *const i32,
-                cu_ptr as *const i32,
-                num_tokens_i32,
-                num_seqs_i32,
-                block_size as i32,
-                block_table_stride as i32,
-                kv_heads as i32,
-                groups_per_head as i32,
-                dev.cuda_stream().cu_stream(),
-                out_dtype_code,
-            );
-        }
+    unsafe {
+        ffi_gather_turbo4_cache(
+            c_ptr as *const core::ffi::c_void,
+            o_ptr as *const core::ffi::c_void,
+            bt_ptr as *const i32,
+            cu_ptr as *const i32,
+            num_tokens_i32,
+            num_seqs_i32,
+            block_size as i32,
+            block_table_stride as i32,
+            kv_heads as i32,
+            groups_per_head as i32,
+            dev.cuda_stream().cu_stream(),
+            out_dtype_code,
+        );
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Gathers K or V from Turbo4's plain (unquantized elementwise) fallback
@@ -150,13 +175,34 @@ pub fn gather_turbo4_cache(
 /// expects, so that function can't be reused here). `cache` and `out` must
 /// share a dtype: the fallback cache is always allocated in the model's own
 /// compute dtype, so there's no cast to do.
-#[allow(clippy::too_many_arguments)]
 pub fn gather_plain_kv_cache(
     cache: &Tensor,       // [num_blocks, block_size, kv_heads, head_size]
     block_table: &Tensor, // [batch, max_blocks]
     cu_seq_lens: &Tensor, // [batch + 1]
     num_tokens: usize,    // cu_seq_lens[-1]
 ) -> Result<Tensor> {
+    let dtype = cache.dtype();
+    let (_num_blocks, _block_size, kv_heads, head_size) = cache.dims4()?;
+    if num_tokens == 0 {
+        return Tensor::zeros((0, kv_heads, head_size), dtype, cache.device());
+    }
+    let out = Tensor::zeros((num_tokens, kv_heads, head_size), dtype, cache.device())?;
+    gather_plain_kv_cache_into(cache, block_table, cu_seq_lens, num_tokens, &out)?;
+    Ok(out)
+}
+
+/// Same as [`gather_plain_kv_cache`] but writes into a caller-provided `out` instead of
+/// allocating a fresh tensor -- see [`gather_turbo4_cache_into`]'s docs for why this shape of
+/// API exists (CUDA-graph-persistent buffers reused across replays at a fixed bucket size).
+/// `out` must share `cache`'s dtype (the plain fallback cache is always in the model's own
+/// compute dtype already, so there's no cast to do) and have `>= num_tokens` rows.
+pub fn gather_plain_kv_cache_into(
+    cache: &Tensor,
+    block_table: &Tensor,
+    cu_seq_lens: &Tensor,
+    num_tokens: usize,
+    out: &Tensor,
+) -> Result<()> {
     let dtype = cache.dtype();
     let dtype_code = out_dtype_code(dtype, "gather_plain_kv_cache")?;
 
@@ -165,6 +211,20 @@ pub fn gather_plain_kv_cache(
     validate_block_table_and_cu_seq_lens(&block_table, &cu_seq_lens, "gather_plain_kv_cache")?;
 
     let (_num_blocks, block_size, kv_heads, head_size) = cache.dims4()?;
+    if out.dtype() != dtype {
+        candle_core::bail!(
+            "gather_plain_kv_cache: out dtype {:?} does not match cache dtype {:?}",
+            out.dtype(),
+            dtype
+        );
+    }
+    let (out_rows, out_kv_heads, out_head_size) = out.dims3()?;
+    if out_rows < num_tokens || out_kv_heads != kv_heads || out_head_size != head_size {
+        candle_core::bail!(
+            "gather_plain_kv_cache: out shape {:?} cannot hold {num_tokens} tokens of (kv_heads={kv_heads}, head_size={head_size})",
+            out.dims()
+        );
+    }
 
     let cu_seq_lens_len = cu_seq_lens.dims1()?;
     let num_seqs = cu_seq_lens_len
@@ -176,79 +236,75 @@ pub fn gather_plain_kv_cache(
         .map_err(|_| candle_core::Error::msg("num_seqs exceeds the kernel i32 limit"))?;
 
     if num_tokens == 0 {
-        return Tensor::zeros((0, kv_heads, head_size), dtype, cache.device());
+        return Ok(());
     }
 
-    let out = Tensor::zeros((num_tokens, kv_heads, head_size), dtype, cache.device())?;
+    let (c_s, c_l) = cache.storage_and_layout();
+    let c_s = match &*c_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cache must be a cuda tensor"),
+    };
+    let (o_s, o_l) = out.storage_and_layout();
+    let o_s = match &*o_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("out must be a cuda tensor"),
+    };
 
-    {
-        let (c_s, c_l) = cache.storage_and_layout();
-        let c_s = match &*c_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("cache must be a cuda tensor"),
-        };
-        let (o_s, o_l) = out.storage_and_layout();
-        let o_s = match &*o_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("out must be a cuda tensor"),
-        };
+    let ((c_ptr, _c_guard), (o_ptr, _o_guard)) = match dtype {
+        DType::F16 => (
+            slice_ptr(c_s.as_cuda_slice::<half::f16>()?, c_l.start_offset()),
+            slice_ptr(o_s.as_cuda_slice::<half::f16>()?, o_l.start_offset()),
+        ),
+        DType::BF16 => (
+            slice_ptr(c_s.as_cuda_slice::<half::bf16>()?, c_l.start_offset()),
+            slice_ptr(o_s.as_cuda_slice::<half::bf16>()?, o_l.start_offset()),
+        ),
+        DType::F32 => (
+            slice_ptr(c_s.as_cuda_slice::<f32>()?, c_l.start_offset()),
+            slice_ptr(o_s.as_cuda_slice::<f32>()?, o_l.start_offset()),
+        ),
+        _ => unreachable!(),
+    };
 
-        let ((c_ptr, _c_guard), (o_ptr, _o_guard)) = match dtype {
-            DType::F16 => (
-                slice_ptr(c_s.as_cuda_slice::<half::f16>()?, c_l.start_offset()),
-                slice_ptr(o_s.as_cuda_slice::<half::f16>()?, o_l.start_offset()),
-            ),
-            DType::BF16 => (
-                slice_ptr(c_s.as_cuda_slice::<half::bf16>()?, c_l.start_offset()),
-                slice_ptr(o_s.as_cuda_slice::<half::bf16>()?, o_l.start_offset()),
-            ),
-            DType::F32 => (
-                slice_ptr(c_s.as_cuda_slice::<f32>()?, c_l.start_offset()),
-                slice_ptr(o_s.as_cuda_slice::<f32>()?, o_l.start_offset()),
-            ),
-            _ => unreachable!(),
-        };
+    let (bt_s, bt_l) = block_table.storage_and_layout();
+    let bt_s = match &*bt_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("block_table must be a cuda tensor"),
+    };
+    let (bt_ptr, _bt_guard) = slice_ptr(bt_s.as_cuda_slice::<u32>()?, bt_l.start_offset());
 
-        let (bt_s, bt_l) = block_table.storage_and_layout();
-        let bt_s = match &*bt_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("block_table must be a cuda tensor"),
-        };
-        let (bt_ptr, _bt_guard) = slice_ptr(bt_s.as_cuda_slice::<u32>()?, bt_l.start_offset());
+    let (cu_s, cu_l) = cu_seq_lens.storage_and_layout();
+    let cu_s = match &*cu_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cu_seq_lens must be a cuda tensor"),
+    };
+    let (cu_ptr, _cu_guard) = if cu_seq_lens.dtype() == DType::I32 {
+        slice_ptr(cu_s.as_cuda_slice::<i32>()?, cu_l.start_offset())
+    } else {
+        slice_ptr(cu_s.as_cuda_slice::<u32>()?, cu_l.start_offset())
+    };
 
-        let (cu_s, cu_l) = cu_seq_lens.storage_and_layout();
-        let cu_s = match &*cu_s {
-            Storage::Cuda(s) => s,
-            _ => candle_core::bail!("cu_seq_lens must be a cuda tensor"),
-        };
-        let (cu_ptr, _cu_guard) = if cu_seq_lens.dtype() == DType::I32 {
-            slice_ptr(cu_s.as_cuda_slice::<i32>()?, cu_l.start_offset())
-        } else {
-            slice_ptr(cu_s.as_cuda_slice::<u32>()?, cu_l.start_offset())
-        };
+    let (_, block_table_stride) = bt_l.shape().dims2()?;
+    let dev = c_s.device();
 
-        let (_, block_table_stride) = bt_l.shape().dims2()?;
-        let dev = c_s.device();
-
-        unsafe {
-            ffi_gather_plain_kv_cache(
-                c_ptr as *const core::ffi::c_void,
-                o_ptr as *const core::ffi::c_void,
-                bt_ptr as *const i32,
-                cu_ptr as *const i32,
-                num_tokens_i32,
-                num_seqs_i32,
-                block_size as i32,
-                block_table_stride as i32,
-                kv_heads as i32,
-                head_size as i32,
-                dev.cuda_stream().cu_stream(),
-                dtype_code,
-            );
-        }
+    unsafe {
+        ffi_gather_plain_kv_cache(
+            c_ptr as *const core::ffi::c_void,
+            o_ptr as *const core::ffi::c_void,
+            bt_ptr as *const i32,
+            cu_ptr as *const i32,
+            num_tokens_i32,
+            num_seqs_i32,
+            block_size as i32,
+            block_table_stride as i32,
+            kv_heads as i32,
+            head_size as i32,
+            dev.cuda_stream().cu_stream(),
+            dtype_code,
+        );
     }
 
-    Ok(out)
+    Ok(())
 }
 
 /// Fused rotate + quantize + pack + scatter for a Turbo4-packed KV cache: quantizes `x` (last
