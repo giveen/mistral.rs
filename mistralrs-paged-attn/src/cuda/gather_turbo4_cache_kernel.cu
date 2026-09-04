@@ -4,6 +4,7 @@
 #include <stdio.h>
 
 #include "cuda_compat.h"
+#include "turbo4_common.cuh"
 
 #include <algorithm>
 
@@ -19,59 +20,6 @@
 
 namespace vllm {
 namespace turbo4 {
-
-// Mirrors mistralrs-core/src/paged_attention/turbo_quant.rs exactly: signed
-// Walsh-Hadamard rotation (seed=42) + fixed 4-bit Lloyd-Max centroids tuned
-// for N(0, 1/128), plus the arithmetic 2-byte fixed-point norm encoding used
-// by quantize_turbo4_tensor/pack_turbo4_block (NOT the f16 encoding the
-// scalar BlockTurbo4 reference type uses -- that one is CPU-test-only).
-constexpr int GROUP = 128;
-constexpr int BLOCK_BYTES = 2 + GROUP / 2; // 66
-constexpr float INV_SQRT_GROUP = 0.088388350f; // 1 / sqrt(128)
-constexpr float NORM_SCALE_MAX = 4096.0f;
-constexpr float NORM_LEVELS = 65535.0f;
-
-__constant__ float kWhtSigns1[GROUP] = {
-    -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
-    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
-    1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
-    -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
-    1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f,
-    -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f,
-    1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f,
-};
-__constant__ float kWhtSigns2[GROUP] = {
-    1.0f, 1.0f, 1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f,
-    1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, 1.0f,
-    1.0f, 1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f,
-    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
-    1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, 1.0f,
-    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
-    1.0f, -1.0f, 1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, -1.0f, 1.0f,
-    -1.0f, 1.0f, -1.0f, 1.0f, 1.0f, -1.0f, 1.0f, -1.0f, 1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f, 1.0f, -1.0f,
-};
-__constant__ float kCentroids4Bit[16] = {
-    -0.241529f, -0.182877f, -0.143016f, -0.111036f, -0.083292f, -0.058050f, -0.034299f, -0.011349f,
-    0.011349f, 0.034299f, 0.058050f, 0.083292f, 0.111036f, 0.143016f, 0.182877f, 0.241529f,
-};
-
-template <typename out_t>
-__device__ __forceinline__ void store_out(out_t *ptr, float v);
-
-template <>
-__device__ __forceinline__ void store_out<uint16_t>(uint16_t *ptr, float v) {
-  *ptr = __half_as_ushort(__float2half_rn(v));
-}
-template <>
-__device__ __forceinline__ void store_out<__nv_bfloat16>(__nv_bfloat16 *ptr,
-                                                          float v) {
-  *ptr = __float2bfloat16_rn(v);
-}
-template <>
-__device__ __forceinline__ void store_out<float>(float *ptr, float v) {
-  *ptr = v;
-}
 
 /// One CUDA block per (token, kv_head, group); GROUP=128 threads, one per
 /// element. Dequantizes a packed Turbo4 block (2-byte fixed-point norm + 64
@@ -149,32 +97,18 @@ gather_turbo4_cache_kernel(const uint8_t *__restrict__ cache,
   sh[tid] = kCentroids4Bit[nibble] * s_norm;
   __syncthreads();
 
-  // rotate_inverse: x *= signs2; fwht_128(x) (includes the 1/sqrt(N) scale
-  // baked in below); x *= signs1.
+  // rotate_inverse: x *= signs2; fwht_128(x) (1/sqrt(N) scale applied below); x *= signs1.
   sh[tid] *= kWhtSigns2[tid];
   __syncthreads();
 
-#pragma unroll
-  for (int h = 1; h < GROUP; h <<= 1) {
-    // Index tid owns exactly one butterfly pair (tid, tid+h) whenever
-    // (tid & h) == 0 -- no other thread reads or writes either slot this
-    // stage, so read-then-write needs no intra-stage sync, only the
-    // end-of-stage syncthreads before the next stage's pairs read them.
-    if ((tid & h) == 0) {
-      const float a = sh[tid];
-      const float b = sh[tid + h];
-      sh[tid] = a + b;
-      sh[tid + h] = a - b;
-    }
-    __syncthreads();
-  }
+  fwht_128(sh, tid);
 
   const float rotated = sh[tid] * INV_SQRT_GROUP * kWhtSigns1[tid];
 
   const int64_t out_base = static_cast<int64_t>(token_id) * kv_heads * head_size +
                            static_cast<int64_t>(head_idx) * head_size +
                            static_cast<int64_t>(group_idx) * GROUP + tid;
-  store_out(out + out_base, rotated);
+  store_f32(out + out_base, rotated);
 }
 
 } // namespace turbo4

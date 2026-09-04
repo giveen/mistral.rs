@@ -287,6 +287,17 @@ extern "C" {
         out_dtype: u32,
     );
 
+    pub fn write_turbo4_cache(
+        x: *const c_void,
+        cache: *const c_void,
+        slot_mapping: *const c_long,
+        num_tokens: c_int,
+        kv_heads: c_int,
+        groups_per_head: c_int,
+        stream: CUstream,
+        in_dtype: u32,
+    );
+
     pub fn gather_plain_kv_cache(
         cache: *const c_void,
         out: *const c_void,

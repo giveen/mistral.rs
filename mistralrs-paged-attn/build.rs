@@ -95,6 +95,8 @@ fn main() -> Result<()> {
     println!("cargo:rerun-if-changed=src/cuda/gather_kv_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/gather_turbo4_cache_kernel.cu");
     println!("cargo:rerun-if-changed=src/cuda/gather_plain_kv_cache_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/write_turbo4_cache_kernel.cu");
+    println!("cargo:rerun-if-changed=src/cuda/turbo4_common.cuh");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/flashinfer_mla_decode.cu");
     println!("cargo:rerun-if-changed=src/cuda/update_kvscales.cu");

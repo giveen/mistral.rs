@@ -9,7 +9,7 @@ pub use backend::{
     flash_attn_sinks_varlen, flashinfer_decode, flashinfer_mla_decode, gather_kv_cache,
     gather_kv_cache_flashinfer, gather_mla_cache, gather_plain_kv_cache, gather_turbo4_cache,
     is_flashinfer_cache, kv_scale_update, paged_attention, reshape_and_cache,
-    reshape_and_cache_flashinfer, swap_blocks,
+    reshape_and_cache_flashinfer, swap_blocks, write_turbo4_cache,
     Fa3DecodeMetadata, Fa3DecodeParams, Fa3DecodeSchedule, Fa3PagedMetadataLayout,
     FlashInferDecodeScratch, FA3_DECODE_MAX_QUERY_LEN, USE_FA3_FP8_PAGED,
 };

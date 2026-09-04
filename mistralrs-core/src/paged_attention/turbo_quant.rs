@@ -13,13 +13,14 @@
 //! centroids tuned for that per-coordinate distribution, and the norm is stored alongside so
 //! dequantization can scale back up.
 //!
-//! This is CPU reference / data-format scaffolding only. `PagedCacheType::validate` in
-//! `cache_engine.rs` refuses to let a model actually run with `PagedCacheType::Turbo4`: the
-//! native `reshape_and_cache`/`gather_kv_cache`/paged-attention kernels in `mistralrs-paged-attn`
-//! only understand f32/f16/bf16/f8e4m3 element layouts, not these packed sub-byte blocks.
-
-// Scaffolding: nothing outside `cache_engine::CacheEngine::calculate_turbo4_block_shape` and
-// `#[cfg(test)]` calls into this yet, pending the paged-attention kernel work described above.
+//! `PagedCacheType::Turbo4` is wired into the real PagedAttention dispatch path (see
+//! `layers::paged_attention::forward_turbo4`). The write side and CPU/eager read fallback go
+//! through the vectorized `Tensor`-op functions below (`quantize_turbo4_tensor`,
+//! `write_turbo4_cache`, `read_turbo4_cache`, ...); the batched CUDA decode path instead calls
+//! the fused `mistralrs_paged_attn::gather_turbo4_cache` kernel, which reimplements this same
+//! rotation/dequant math directly on-GPU (kept in sync via
+//! `gather_turbo4_cache_kernel_matches_eager_reference`). `quantize_turbo4`/`dequantize_turbo4`
+//! (the scalar, non-vectorized reference) are CPU-test-only.
 #![allow(dead_code)]
 
 use std::sync::{Mutex, OnceLock};
@@ -832,6 +833,102 @@ mod tests {
             let sim = cosine_similarity(expected, &got);
             assert!(sim > 0.9, "token {i} (slot {slot}): cosine too low: {sim}");
         }
+        Ok(())
+    }
+
+    /// Validates the fused CUDA write kernel (`mistralrs_paged_attn::write_turbo4_cache`)
+    /// against the eager Tensor-op reference (`write_turbo4_cache` in this module): writes the
+    /// same tokens into two separate caches via the two paths, then reads both back through the
+    /// shared `read_turbo4_cache` reference and compares the dequantized vectors. Compares
+    /// reconstructed vectors rather than raw packed bytes since the two paths compute the
+    /// rotation differently (matmul-against-a-precomputed-matrix vs explicit sign+butterfly), so
+    /// individual centroid picks can legitimately differ by one bin right at a boundary --
+    /// matches `tensor_quantize_matches_scalar_reference_within_tolerance`'s tolerance-based
+    /// philosophy for the same reason. Also exercises one padding token (negative slot_mapping
+    /// entry) to check the kernel's `if (flat_slot < 0) return;` guard.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    fn write_turbo4_cache_kernel_matches_eager_reference() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        const NUM_BLOCKS: usize = 4;
+        const BLOCK_SIZE: usize = 2;
+        const KV_HEADS: usize = 1;
+        const GROUPS_PER_HEAD: usize = 1;
+
+        let tokens: Vec<[f32; GROUP]> = [5, 17, 31].iter().map(|&s| test_vector(s)).collect();
+        let flat: Vec<f32> = tokens.iter().flatten().copied().collect();
+        let x = Tensor::from_slice(&flat, (3, KV_HEADS, GROUPS_PER_HEAD, GROUP), &device)?;
+        // Slot mapping includes one padding entry (-1): the fused kernel must skip it, and the
+        // eager reference must never actually be asked to write it (it isn't padding-aware).
+        let slot_mapping_eager = Tensor::new(&[0i64, 1, 2], &device)?;
+        let slot_mapping_kernel = Tensor::new(&[0i64, -1, 1, 2], &device)?;
+        let x_kernel = Tensor::cat(
+            &[&x.narrow(0, 0, 1)?, &Tensor::zeros((1, KV_HEADS, GROUPS_PER_HEAD, GROUP), DType::F32, &device)?, &x.narrow(0, 1, 2)?],
+            0,
+        )?;
+
+        let cache_shape = (
+            NUM_BLOCKS * BLOCK_SIZE,
+            KV_HEADS,
+            GROUPS_PER_HEAD,
+            BLOCK_TURBO4_BYTES,
+        );
+        let flat_cache_eager = Tensor::zeros(cache_shape, DType::U8, &device)?;
+        write_turbo4_cache(&x, &flat_cache_eager, &slot_mapping_eager)?;
+
+        // write_turbo4_cache (both the eager reference and the fused kernel) takes the flat
+        // slot-indexed cache shape; block-indexed reshapes are only needed for the read side.
+        let flat_cache_kernel = Tensor::zeros(cache_shape, DType::U8, &device)?;
+        mistralrs_paged_attn::write_turbo4_cache(&x_kernel, &flat_cache_kernel, &slot_mapping_kernel)?;
+        let block_cache_kernel = flat_cache_kernel.reshape((
+            NUM_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            GROUPS_PER_HEAD,
+            BLOCK_TURBO4_BYTES,
+        ))?;
+
+        let block_cache_eager = flat_cache_eager.reshape((
+            NUM_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            GROUPS_PER_HEAD,
+            BLOCK_TURBO4_BYTES,
+        ))?;
+        let recovered_eager = read_turbo4_cache(&block_cache_eager, &[0, 1], 3)?;
+        let recovered_kernel = read_turbo4_cache(&block_cache_kernel, &[0, 1], 3)?;
+
+        let eager_vals: Vec<f32> = recovered_eager.reshape(3 * GROUP)?.to_vec1()?;
+        let kernel_vals: Vec<f32> = recovered_kernel.reshape(3 * GROUP)?.to_vec1()?;
+        for (i, expected) in tokens.iter().enumerate() {
+            let eager: [f32; GROUP] = eager_vals[i * GROUP..(i + 1) * GROUP].try_into().unwrap();
+            let kernel: [f32; GROUP] = kernel_vals[i * GROUP..(i + 1) * GROUP].try_into().unwrap();
+            let sim_eager = cosine_similarity(expected, &eager);
+            let sim_kernel = cosine_similarity(expected, &kernel);
+            assert!(sim_eager > 0.9, "token {i}: eager reference cosine too low: {sim_eager}");
+            assert!(sim_kernel > 0.9, "token {i}: fused write kernel cosine too low: {sim_kernel}");
+            let sim_cross = cosine_similarity(&eager, &kernel);
+            assert!(
+                sim_cross > 0.999,
+                "token {i}: fused write kernel disagrees with eager reference: cosine {sim_cross}"
+            );
+        }
+
+        // Slot 3 (block 1, offset 1) is never targeted by any slot_mapping entry, padding or
+        // otherwise; if the fused kernel's `if (flat_slot < 0) return;` guard were broken, an
+        // out-of-bounds write from the padding entry (-1) would be the likeliest way to disturb
+        // memory near it, so this is a cheap sanity check that nothing did.
+        let untouched_slot: Vec<u8> = block_cache_kernel
+            .narrow(0, 1, 1)?
+            .narrow(1, 1, 1)?
+            .reshape(BLOCK_TURBO4_BYTES)?
+            .to_vec1()?;
+        assert!(
+            untouched_slot.iter().all(|&b| b == 0),
+            "fused write kernel touched a slot no entry (padding or otherwise) targeted"
+        );
         Ok(())
     }
 

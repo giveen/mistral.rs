@@ -2,6 +2,7 @@ use crate::cuda::backend::slice_ptr;
 use crate::cuda::ffi::{
     gather_plain_kv_cache as ffi_gather_plain_kv_cache,
     gather_turbo4_cache as ffi_gather_turbo4_cache,
+    write_turbo4_cache as ffi_write_turbo4_cache,
 };
 use candle_core::backend::BackendStorage;
 use candle_core::{DType, Result, Storage, Tensor};
@@ -248,4 +249,108 @@ pub fn gather_plain_kv_cache(
     }
 
     Ok(out)
+}
+
+/// Fused rotate + quantize + pack + scatter for a Turbo4-packed KV cache: quantizes `x` (last
+/// dim `GROUP`) and writes the packed blocks into `cache` at `slot_mapping`'s flat slots,
+/// entirely on-GPU in one kernel launch. The Rust equivalent this replaces
+/// (`quantize_turbo4_tensor` + `pack_turbo4_block` + `scatter_set`) was already host-sync-free,
+/// just several small kernel launches instead of one; this collapses that into a single fused
+/// pass, matching `gather_turbo4_cache`'s read-side kernel.
+///
+/// `x` has shape `(num_tokens, kv_heads, groups_per_head, GROUP)`. `cache` has the *flat*
+/// slot-indexed shape `(num_slots, kv_heads, groups_per_head, BLOCK_TURBO4_BYTES)` -- num_slots
+/// = num_blocks * block_size collapsed into one dim, matching `write_turbo4_cache`'s (the eager
+/// Tensor-op reference in `turbo_quant.rs`) convention, not `gather_turbo4_cache`'s
+/// block-indexed 5D read-side cache shape. `slot_mapping` is a `num_tokens`-length i64 tensor of
+/// flat slot indices (negative entries are padding and are skipped, matching
+/// `reshape_and_cache`'s convention).
+pub fn write_turbo4_cache(x: &Tensor, cache: &Tensor, slot_mapping: &Tensor) -> Result<()> {
+    if cache.dtype() != DType::U8 {
+        candle_core::bail!(
+            "write_turbo4_cache expects a u8 packed cache, got {:?}",
+            cache.dtype()
+        );
+    }
+    if slot_mapping.dtype() != DType::I64 {
+        candle_core::bail!(
+            "write_turbo4_cache expects an i64 slot_mapping, got {:?}",
+            slot_mapping.dtype()
+        );
+    }
+    let in_dtype_code = out_dtype_code(x.dtype(), "write_turbo4_cache")?;
+
+    let (num_tokens, x_kv_heads, x_groups_per_head, group) = x.dims4()?;
+    if group != TURBO4_GROUP {
+        candle_core::bail!("write_turbo4_cache expects last dim {TURBO4_GROUP}, got {group}");
+    }
+    let (_num_slots, kv_heads, groups_per_head, block_bytes) = cache.dims4()?;
+    if block_bytes != BLOCK_TURBO4_BYTES {
+        candle_core::bail!(
+            "write_turbo4_cache expects cache last dim {BLOCK_TURBO4_BYTES}, got {block_bytes}"
+        );
+    }
+    if kv_heads != x_kv_heads || groups_per_head != x_groups_per_head {
+        candle_core::bail!(
+            "write_turbo4_cache: x (kv_heads={x_kv_heads}, groups_per_head={x_groups_per_head}) \
+             does not match cache (kv_heads={kv_heads}, groups_per_head={groups_per_head})"
+        );
+    }
+    if slot_mapping.dims1()? != num_tokens {
+        candle_core::bail!(
+            "write_turbo4_cache: slot_mapping length {} does not match x's {num_tokens} tokens",
+            slot_mapping.dims1()?
+        );
+    }
+    let num_tokens_i32 = i32::try_from(num_tokens)
+        .map_err(|_| candle_core::Error::msg("num_tokens exceeds the kernel i32 limit"))?;
+
+    if num_tokens == 0 {
+        return Ok(());
+    }
+
+    let x = x.contiguous()?;
+    let slot_mapping = slot_mapping.contiguous()?;
+
+    let (x_s, x_l) = x.storage_and_layout();
+    let x_s = match &*x_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("x must be a cuda tensor"),
+    };
+    let (c_s, c_l) = cache.storage_and_layout();
+    let c_s = match &*c_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("cache must be a cuda tensor"),
+    };
+    let (sm_s, sm_l) = slot_mapping.storage_and_layout();
+    let sm_s = match &*sm_s {
+        Storage::Cuda(s) => s,
+        _ => candle_core::bail!("slot_mapping must be a cuda tensor"),
+    };
+
+    let (x_ptr, _x_guard) = match x.dtype() {
+        DType::F16 => slice_ptr(x_s.as_cuda_slice::<half::f16>()?, x_l.start_offset()),
+        DType::BF16 => slice_ptr(x_s.as_cuda_slice::<half::bf16>()?, x_l.start_offset()),
+        DType::F32 => slice_ptr(x_s.as_cuda_slice::<f32>()?, x_l.start_offset()),
+        _ => unreachable!(),
+    };
+    let (c_ptr, _c_guard) = slice_ptr(c_s.as_cuda_slice::<u8>()?, c_l.start_offset());
+    let (sm_ptr, _sm_guard) = slice_ptr(sm_s.as_cuda_slice::<i64>()?, sm_l.start_offset());
+
+    let dev = x_s.device();
+
+    unsafe {
+        ffi_write_turbo4_cache(
+            x_ptr as *const core::ffi::c_void,
+            c_ptr as *const core::ffi::c_void,
+            sm_ptr as *const i64,
+            num_tokens_i32,
+            kv_heads as i32,
+            groups_per_head as i32,
+            dev.cuda_stream().cu_stream(),
+            in_dtype_code,
+        );
+    }
+
+    Ok(())
 }

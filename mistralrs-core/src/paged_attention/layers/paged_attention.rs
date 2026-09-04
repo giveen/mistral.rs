@@ -2218,6 +2218,19 @@ impl PagedAttention {
                     groups_per_head,
                     turbo_quant::BLOCK_TURBO4_BYTES,
                 ))?;
+                // The fused CUDA kernel is a single launch (rotate + quantize + pack +
+                // scatter); the Tensor-op reference below is several small kernel launches for
+                // the same result. Both are already host-sync-free, so this is purely a
+                // launch-overhead win, not a correctness one -- CPU/Metal keep the Tensor-op
+                // path since the fused kernel only exists for CUDA.
+                #[cfg(all(feature = "cuda", target_family = "unix"))]
+                if flat_cache.device().is_cuda() {
+                    return mistralrs_paged_attn::write_turbo4_cache(
+                        tokens,
+                        &flat_cache,
+                        &ctx.slot_mapping,
+                    );
+                }
                 turbo_quant::write_turbo4_cache(tokens, &flat_cache, &ctx.slot_mapping)
             } else {
                 let tokens_flat =
