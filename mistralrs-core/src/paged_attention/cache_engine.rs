@@ -74,34 +74,35 @@ impl PagedCacheType {
                 if !model_config.layer_has_paged_kv_cache(layer_idx) {
                     continue;
                 }
-                match model_config.kv_cache_layout_for_layer(layer_idx) {
-                    KvCacheLayout::Standard | KvCacheLayout::StandardNoFlashInfer => {}
-                    other => {
-                        let msg = format!(
-                            "Turbo4 KV cache does not support the {other:?} layout (layer {layer_idx})"
-                        );
-                        return Err(msg);
-                    }
-                }
-                let head_dim = model_config.k_head_dim_for_layer(layer_idx);
-                if !head_dim.is_multiple_of(turbo_quant::GROUP) {
+                // Turbo4 allocates and dispatches its own packed 5D cache independently of
+                // whichever native layout (Standard vs FlashInfer) the model would otherwise
+                // prefer -- `CacheEngine::allocate_gpu_cache` and `PagedAttention::forward_turbo4`
+                // never consult `kv_cache_layout_for_layer` at all. Only MLA is structurally
+                // incompatible (different per-token K/V shape: kv_lora_rank/kpe_head_dim, not a
+                // per-head vector Turbo4 can rotate/quantize).
+                if let KvCacheLayout::Mla { .. } = model_config.kv_cache_layout_for_layer(layer_idx)
+                {
                     return Err(format!(
-                        "Turbo4 KV cache requires head_dim (got {head_dim} on layer {layer_idx}) \
+                        "Turbo4 KV cache does not support the Mla layout (layer {layer_idx})"
+                    ));
+                }
+                let k_head_dim = model_config.k_head_dim_for_layer(layer_idx);
+                let v_head_dim = model_config.v_head_dim_for_layer(layer_idx);
+                if !k_head_dim.is_multiple_of(turbo_quant::GROUP)
+                    || !v_head_dim.is_multiple_of(turbo_quant::GROUP)
+                {
+                    return Err(format!(
+                        "Turbo4 KV cache requires head_dim (got k={k_head_dim}, v={v_head_dim} on layer {layer_idx}) \
                          to be a multiple of the {}-element rotation group",
                         turbo_quant::GROUP
                     ));
                 }
             }
-            // The data format and CPU quantize/dequantize path exist (see `turbo_quant`), but
-            // nothing downstream can read or write it yet: `mistralrs-paged-attn`'s cache
-            // read/write and paged-attention compute kernels are hardcoded to f32/f16/bf16/f8e4m3
-            // element layouts. Selecting this at runtime would silently corrupt the KV cache, so
-            // refuse until that kernel integration lands.
-            return Err(
-                "Turbo4 KV cache quantization is data-format scaffolding only; the paged-attention \
-                 read/write kernels do not support it yet"
-                    .to_string(),
-            );
+            // Writes go through `PagedAttention::forward_turbo4`'s scatter/gather + eager-attention
+            // path, not the native reshape_and_cache/paged-attention kernels (which only understand
+            // f32/f16/bf16/f8e4m3 element layouts). It doesn't support donor-cache (speculative
+            // decoding) attention yet, or MLA (checked above).
+            return Ok(());
         }
         if !matches!(act_dtype, DType::F16 | DType::BF16 | DType::F32) {
             return Err(format!(
@@ -241,6 +242,29 @@ impl CacheEngine {
             } else {
                 0
             };
+
+            if cache_config.cache_type == PagedCacheType::Turbo4 {
+                // Shape validated (head_dim % GROUP == 0, Standard layout) by `validate` before
+                // `CacheEngine::new` ever calls this. `PagedAttention::forward_turbo4` reshapes
+                // this block-indexed 5D tensor to a flat (slots, ...) view to write into it.
+                let num_kv_heads = model_config.num_kv_heads_for_layer(layer_idx);
+                let k_groups = model_config.k_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
+                let v_groups = model_config.v_head_dim_for_layer(layer_idx) / turbo_quant::GROUP;
+                let block_shape = |groups_per_head: usize| {
+                    (
+                        num_gpu_blocks,
+                        cache_config.block_size,
+                        num_kv_heads,
+                        groups_per_head,
+                        turbo_quant::BLOCK_TURBO4_BYTES,
+                    )
+                };
+                let key_blocks = Tensor::zeros(block_shape(k_groups), DType::U8, device)?;
+                let value_blocks = Tensor::zeros(block_shape(v_groups), DType::U8, device)?;
+                gpu_cache.push((key_blocks, value_blocks));
+                continue;
+            }
+
             let requested_kv_cache_layout = model_config.kv_cache_layout_for_layer(layer_idx);
             let kv_cache_layout =
                 if matches!(requested_kv_cache_layout, KvCacheLayout::FlashInferHnd)
@@ -605,35 +629,6 @@ impl CacheEngine {
             model_config.k_head_dim_for_layer(layer_idx),
         )
     }
-
-    /// Byte-based block shape a `Turbo4` paged KV cache layer would need: `(num_kv_heads,
-    /// block_size, bytes_per_token)`, backing a `DType::U8` tensor of shape `(num_gpu_blocks,
-    /// num_kv_heads, block_size, bytes_per_token)`.
-    ///
-    /// NOT wired into `allocate_gpu_cache` yet: `PagedCacheType::Turbo4::validate` always
-    /// errors before `CacheEngine::new` gets this far (see its doc comment), since the
-    /// paged-attention read/write kernels can't consume this layout. This exists to pin down
-    /// the shape a future kernel integration would need to target.
-    #[allow(dead_code)]
-    fn calculate_turbo4_block_shape(
-        model_config: &dyn ModelConfigLike,
-        block_size: usize,
-        layer_idx: usize,
-    ) -> Result<(usize, usize, usize)> {
-        let head_dim = model_config.k_head_dim_for_layer(layer_idx);
-        if !head_dim.is_multiple_of(turbo_quant::GROUP) {
-            return Err(candle_core::Error::msg(format!(
-                "Turbo4 KV cache requires head_dim ({head_dim}) to be a multiple of the {}-element rotation group",
-                turbo_quant::GROUP
-            )));
-        }
-        let groups_per_head = head_dim / turbo_quant::GROUP;
-        Ok((
-            model_config.num_kv_heads_for_layer(layer_idx),
-            block_size,
-            groups_per_head * turbo_quant::BLOCK_TURBO4_BYTES,
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -685,20 +680,19 @@ mod tests {
     }
 
     #[test]
-    fn turbo4_cache_is_not_yet_wired_up() {
-        let err = PagedCacheType::Turbo4
+    fn turbo4_cache_accepts_valid_standard_layout() {
+        PagedCacheType::Turbo4
             .validate(
                 DType::BF16,
                 &model_config(KvCacheLayout::Standard),
                 &Device::Cpu,
                 &[],
             )
-            .unwrap_err();
-        assert!(err.contains("scaffolding only"));
+            .unwrap();
     }
 
     #[test]
-    fn turbo4_cache_rejects_mla_before_the_scaffolding_check() {
+    fn turbo4_cache_rejects_mla_layout() {
         let err = PagedCacheType::Turbo4
             .validate(
                 DType::BF16,
@@ -724,11 +718,24 @@ mod tests {
     }
 
     #[test]
-    fn turbo4_block_shape_packs_one_group_per_head() -> Result<()> {
+    fn turbo4_cache_allocates_packed_u8_blocks() -> Result<()> {
         let model = model_config(KvCacheLayout::Standard);
-        let shape = CacheEngine::calculate_turbo4_block_shape(&model, 32, 0)?;
-        // 4 kv heads, block_size 32 tokens, 66 packed bytes per 128-wide head vector.
-        assert_eq!(shape, (4, 32, 66));
+        let cache = CacheConfig {
+            block_size: 32,
+            num_gpu_blocks: 3,
+            cache_type: PagedCacheType::Turbo4,
+            kv_cache_group_ids: vec![0],
+        };
+        let engine = CacheEngine::new(&model, &cache, DType::BF16, &Device::Cpu, vec![None; 2])?;
+        let kv_cache = engine.get_kv_cache();
+        assert_eq!(kv_cache.len(), 2);
+        for (key_blocks, value_blocks) in kv_cache.iter() {
+            assert_eq!(key_blocks.dtype(), DType::U8);
+            assert_eq!(value_blocks.dtype(), DType::U8);
+            // (num_gpu_blocks, block_size, kv_heads, groups_per_head, BLOCK_TURBO4_BYTES)
+            assert_eq!(key_blocks.dims(), &[3, 32, 4, 1, 66]);
+            assert_eq!(value_blocks.dims(), &[3, 32, 4, 1, 66]);
+        }
         Ok(())
     }
 

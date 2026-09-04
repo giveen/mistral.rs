@@ -25,7 +25,7 @@ use crate::{
             gather_prefill_workspace_for_lengths, DecodePlan, DecodePlanInput,
             GatherPrefillWorkspaceRequest, PrefixPrefillPlan, PrefixPrefillPlanInput,
         },
-        AttentionBackendKind, Fp8AttentionScales, _PAD_SLOT_ID,
+        turbo_quant, AttentionBackendKind, Fp8AttentionScales, _PAD_SLOT_ID,
     },
     pipeline::text_models_inputs_processor::{
         FlashKMeta, FlashParams, PagedAttentionInputMetadata,
@@ -2028,6 +2028,125 @@ impl PagedAttention {
     }
 
     #[allow(clippy::too_many_arguments)]
+    /// Eager-attention fallback for a Turbo4-quantized paged cache: writes the incoming K/V
+    /// into the packed cache via [`turbo_quant::write_turbo4_cache`], then for each sequence in
+    /// the batch gathers and dequantizes its full KV via [`turbo_quant::read_turbo4_cache`] and
+    /// runs ordinary eager attention. Correctness-first, not fused: this bypasses the native
+    /// paged-attention kernels entirely (they don't understand packed sub-byte blocks), so it
+    /// won't match their throughput, only their output.
+    fn forward_turbo4(
+        &self,
+        ctx: &PagedForwardCtx<'_>,
+        tensors: PagedForwardTensors<'_>,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+    ) -> Result<Tensor> {
+        let PagedForwardDims {
+            batch_size,
+            seq_len,
+            head_size,
+            key_value_heads,
+            ..
+        } = ctx.dims;
+        if !head_size.is_multiple_of(turbo_quant::GROUP) {
+            candle_core::bail!(
+                "turbo4 attention requires head_size ({head_size}) to be a multiple of {}",
+                turbo_quant::GROUP
+            );
+        }
+        let groups_per_head = head_size / turbo_quant::GROUP;
+
+        let (num_gpu_blocks, block_size, cache_kv_heads, cache_groups, cache_bytes) =
+            key_cache.dims5()?;
+        if cache_kv_heads != key_value_heads
+            || cache_groups != groups_per_head
+            || cache_bytes != turbo_quant::BLOCK_TURBO4_BYTES
+        {
+            candle_core::bail!(
+                "turbo4 cache shape {:?} does not match layer (kv_heads={key_value_heads}, groups_per_head={groups_per_head})",
+                key_cache.dims()
+            );
+        }
+
+        // (batch, kv_heads, seq_len, head_size) -> (tokens, kv_heads, groups_per_head, GROUP)
+        let reshape_kv = |t: &Tensor| -> Result<Tensor> {
+            t.transpose(1, 2)?.contiguous()?.reshape((
+                batch_size * seq_len,
+                key_value_heads,
+                groups_per_head,
+                turbo_quant::GROUP,
+            ))
+        };
+        let key_tokens = reshape_kv(tensors.key)?;
+        let value_tokens = reshape_kv(tensors.value)?;
+
+        let flat_shape = (
+            num_gpu_blocks * block_size,
+            key_value_heads,
+            groups_per_head,
+            turbo_quant::BLOCK_TURBO4_BYTES,
+        );
+        let flat_key_cache = key_cache.reshape(flat_shape)?;
+        let flat_value_cache = value_cache.reshape(flat_shape)?;
+        turbo_quant::write_turbo4_cache(&key_tokens, &flat_key_cache, &ctx.slot_mapping)?;
+        turbo_quant::write_turbo4_cache(&value_tokens, &flat_value_cache, &ctx.slot_mapping)?;
+
+        let device = tensors.query.device();
+        let loc = device.location();
+        let block_tables = ctx.block_tables(&loc).ok_or_else(|| {
+            candle_core::Error::msg(
+                "turbo4 attention requires block tables (no donor/canvas support yet)",
+            )
+        })?;
+        let context_lens_cpu = ctx.context_lens_cpu();
+
+        let mut outputs = Vec::with_capacity(batch_size);
+        for b in 0..batch_size {
+            let kv_len = context_lens_cpu.map_or(seq_len, |lens| lens[b]);
+            let q_b = tensors.query.narrow(0, b, 1)?;
+
+            let row = block_tables
+                .narrow(0, b, 1)?
+                .squeeze(0)?
+                .to_dtype(DType::U32)?;
+            let row_host: Vec<u32> = row.to_vec1()?;
+            let blocks_needed = kv_len.div_ceil(block_size).max(1).min(row_host.len());
+            let table = &row_host[..blocks_needed];
+
+            let k_seq = turbo_quant::read_turbo4_cache(key_cache, table, kv_len)?;
+            let v_seq = turbo_quant::read_turbo4_cache(value_cache, table, kv_len)?;
+            // (kv_len, kv_heads, groups_per_head, GROUP) -> (1, kv_heads, kv_len, head_size)
+            let reshape_seq = |t: Tensor| -> Result<Tensor> {
+                t.reshape((1, kv_len, key_value_heads, head_size))?
+                    .transpose(1, 2)?
+                    .contiguous()
+            };
+            let k_seq = reshape_seq(k_seq)?;
+            let v_seq = reshape_seq(v_seq)?;
+
+            let mask_b = match tensors.attention_mask {
+                AttentionMask::None => AttentionMask::None,
+                AttentionMask::CausalFlash => AttentionMask::CausalFlash,
+                AttentionMask::Custom(mask_tensor) => {
+                    if batch_size == 1 {
+                        AttentionMask::Custom(mask_tensor.clone())
+                    } else if mask_tensor.dims().first() == Some(&batch_size) {
+                        AttentionMask::Custom(mask_tensor.narrow(0, b, 1)?)
+                    } else {
+                        candle_core::bail!(
+                            "turbo4 attention: batched custom attention masks not sliceable by batch row (shape {:?})",
+                            mask_tensor.dims()
+                        );
+                    }
+                }
+            };
+            let out_b = Sdpa.run_attention(&q_b, &k_seq, &v_seq, &mask_b, None, ctx.sdpa_params)?;
+            outputs.push(out_b);
+        }
+        Tensor::cat(&outputs, 0)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn forward_impl(
         &self,
         query: &Tensor,
@@ -2041,6 +2160,14 @@ impl PagedAttention {
         flash_params: Option<&FlashParams>,
         write_cache: bool,
     ) -> Result<Tensor> {
+        let is_turbo4 = key_cache.as_ref().is_some_and(|t| t.dtype() == DType::U8)
+            || value_cache.as_ref().is_some_and(|t| t.dtype() == DType::U8);
+        if is_turbo4 && !write_cache {
+            candle_core::bail!(
+                "Turbo4 KV cache does not yet support donor-cache (speculative decoding) attention"
+            );
+        }
+
         let tensors = PagedForwardTensors {
             query,
             key,
@@ -2063,6 +2190,12 @@ impl PagedAttention {
             flash_params,
             write_cache,
         })?;
+
+        if is_turbo4 {
+            let key_cache = key_cache.take().expect("checked above");
+            let value_cache = value_cache.take().expect("checked above");
+            return self.forward_turbo4(&ctx, tensors, &key_cache, &value_cache);
+        }
 
         if let Some((flash_params, segment_lens)) = flash_params.and_then(|params| {
             params
@@ -2203,6 +2336,126 @@ impl PagedAttention {
 mod tests {
     use super::*;
     use candle_core::D;
+
+    /// Deterministic pseudo-random f32 values in roughly [-1, 1], no `rand` dependency needed.
+    #[allow(clippy::cast_possible_truncation)] // test fixture only, precision doesn't matter
+    fn fake_values(seed: u32, len: usize) -> Vec<f32> {
+        let mut state = seed | 1;
+        (0..len)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 17;
+                state ^= state << 5;
+                (f64::from(state) / f64::from(u32::MAX) - 0.5) as f32 * 2.0
+            })
+            .collect()
+    }
+
+    fn cosine_similarity(a: &Tensor, b: &Tensor) -> Result<f32> {
+        let a = a.flatten_all()?.to_dtype(DType::F32)?;
+        let b = b.flatten_all()?.to_dtype(DType::F32)?;
+        let dot = (&a * &b)?.sum_all()?.to_scalar::<f32>()?;
+        let na = a.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        let nb = b.sqr()?.sum_all()?.to_scalar::<f32>()?.sqrt();
+        Ok(dot / (na * nb))
+    }
+
+    /// Proves `PagedAttention::forward` actually works end to end against a Turbo4 cache: writes
+    /// a 3-token prompt through the real dispatch path (`forward_impl` -> `forward_turbo4`),
+    /// reads it back, and checks the result is close to running the same attention directly on
+    /// the un-quantized K/V (the only difference should be the 4-bit quantization's lossiness).
+    #[allow(clippy::cast_precision_loss)] // HEAD_SIZE is a small compile-time constant (128)
+    fn turbo4_forward_matches_direct_attention_closely_on(device: Device) -> Result<()> {
+        const HEADS: usize = 2;
+        const KV_HEADS: usize = 2;
+        const SEQ_LEN: usize = 3;
+        const HEAD_SIZE: usize = turbo_quant::GROUP;
+        const BLOCK_SIZE: usize = 4;
+        const NUM_GPU_BLOCKS: usize = 2;
+
+        let query = Tensor::from_vec(
+            fake_values(1, HEADS * SEQ_LEN * HEAD_SIZE),
+            (1, HEADS, SEQ_LEN, HEAD_SIZE),
+            &device,
+        )?;
+        let key = Tensor::from_vec(
+            fake_values(2, KV_HEADS * SEQ_LEN * HEAD_SIZE),
+            (1, KV_HEADS, SEQ_LEN, HEAD_SIZE),
+            &device,
+        )?;
+        let value = Tensor::from_vec(
+            fake_values(3, KV_HEADS * SEQ_LEN * HEAD_SIZE),
+            (1, KV_HEADS, SEQ_LEN, HEAD_SIZE),
+            &device,
+        )?;
+
+        let cache_shape = (
+            NUM_GPU_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            1,
+            turbo_quant::BLOCK_TURBO4_BYTES,
+        );
+        let key_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
+        let value_cache = Tensor::zeros(cache_shape, DType::U8, &device)?;
+
+        let mut input_metadata = PagedAttentionInputMetadata::dummy(&device)?;
+        input_metadata.slot_mappings = HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0i64, 1, 2], (1, SEQ_LEN), &device)?,
+        )]);
+        input_metadata.block_tables = Some(HashMap::from([(
+            device.location(),
+            Tensor::from_vec(vec![0u32], (1, 1), &device)?,
+        )]));
+        input_metadata.paged_context_lens_cpu = Some(vec![SEQ_LEN]);
+
+        let sdpa_params = SdpaParams {
+            n_kv_groups: HEADS / KV_HEADS,
+            softcap: None,
+            softmax_scale: 1.0 / (HEAD_SIZE as f32).sqrt(),
+            sliding_window: None,
+            sinks: None,
+        };
+        let mask = AttentionMask::None;
+
+        let pa = PagedAttention::new(HEAD_SIZE, &device, None)?;
+        let turbo_out = pa.forward(
+            &query,
+            &key,
+            &value,
+            &mask,
+            Some(key_cache),
+            Some(value_cache),
+            &input_metadata,
+            &sdpa_params,
+            None,
+        )?;
+
+        let reference_out = Sdpa.run_attention(&query, &key, &value, &mask, None, &sdpa_params)?;
+
+        assert_eq!(turbo_out.dims(), reference_out.dims());
+        let sim = cosine_similarity(&turbo_out, &reference_out)?;
+        assert!(
+            sim > 0.9,
+            "turbo4 attention output diverged too much: cosine={sim}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn turbo4_forward_matches_direct_attention_closely_cpu() -> Result<()> {
+        turbo4_forward_matches_direct_attention_closely_on(Device::Cpu)
+    }
+
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    fn turbo4_forward_matches_direct_attention_closely_cuda() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        turbo4_forward_matches_direct_attention_closely_on(device)
+    }
 
     #[test]
     fn cumulative_seqlens_match_checked_host_token_count() -> Result<()> {
