@@ -19,6 +19,7 @@ pub(crate) mod mm_prefix;
 pub(crate) mod plan;
 mod scales;
 mod scheduler;
+mod turbo_quant;
 #[cfg(any(
     test,
     all(feature = "cuda", feature = "flash-attn", target_family = "unix")

@@ -7,6 +7,7 @@ use candle_core::{DType, Device, Result, Tensor};
 use serde::{Deserialize, Serialize};
 
 use super::config::{KvCacheLayout, ModelConfigLike};
+use super::turbo_quant;
 #[cfg(all(feature = "cuda", target_family = "unix"))]
 use crate::flashinfer::{register_fa3_prefill_caches, Fa3PrefillWorkspaceRegistration};
 
@@ -40,12 +41,20 @@ pub enum PagedCacheType {
     #[default]
     Auto,
     F8E4M3,
+    /// WHT-rotated 4-bit Lloyd-Max quantized KV cache (~4.1 bits/value). See `turbo_quant`.
+    ///
+    /// Scaffolding only: `validate` always rejects this today because
+    /// `mistralrs-paged-attn`'s `reshape_and_cache`/`gather_kv_cache`/paged-attention compute
+    /// kernels don't understand packed sub-byte blocks yet, only f32/f16/bf16/f8e4m3 elements.
+    Turbo4,
 }
 
 impl PagedCacheType {
     pub fn to_dtype(&self, act_dtype: DType) -> DType {
         match self {
             PagedCacheType::F8E4M3 => DType::F8E4M3,
+            // Packed blocks are opaque bytes as far as candle is concerned.
+            PagedCacheType::Turbo4 => DType::U8,
             PagedCacheType::Auto => act_dtype,
         }
     }
@@ -59,6 +68,40 @@ impl PagedCacheType {
     ) -> std::result::Result<(), String> {
         if *self == Self::Auto {
             return Ok(());
+        }
+        if *self == Self::Turbo4 {
+            for layer_idx in 0..model_config.num_layers() {
+                if !model_config.layer_has_paged_kv_cache(layer_idx) {
+                    continue;
+                }
+                match model_config.kv_cache_layout_for_layer(layer_idx) {
+                    KvCacheLayout::Standard | KvCacheLayout::StandardNoFlashInfer => {}
+                    other => {
+                        let msg = format!(
+                            "Turbo4 KV cache does not support the {other:?} layout (layer {layer_idx})"
+                        );
+                        return Err(msg);
+                    }
+                }
+                let head_dim = model_config.k_head_dim_for_layer(layer_idx);
+                if !head_dim.is_multiple_of(turbo_quant::GROUP) {
+                    return Err(format!(
+                        "Turbo4 KV cache requires head_dim (got {head_dim} on layer {layer_idx}) \
+                         to be a multiple of the {}-element rotation group",
+                        turbo_quant::GROUP
+                    ));
+                }
+            }
+            // The data format and CPU quantize/dequantize path exist (see `turbo_quant`), but
+            // nothing downstream can read or write it yet: `mistralrs-paged-attn`'s cache
+            // read/write and paged-attention compute kernels are hardcoded to f32/f16/bf16/f8e4m3
+            // element layouts. Selecting this at runtime would silently corrupt the KV cache, so
+            // refuse until that kernel integration lands.
+            return Err(
+                "Turbo4 KV cache quantization is data-format scaffolding only; the paged-attention \
+                 read/write kernels do not support it yet"
+                    .to_string(),
+            );
         }
         if !matches!(act_dtype, DType::F16 | DType::BF16 | DType::F32) {
             return Err(format!(
@@ -111,8 +154,9 @@ impl FromStr for PagedCacheType {
         match s {
             "auto" => Ok(Self::Auto),
             "f8e4m3" => Ok(Self::F8E4M3),
+            "turbo4" => Ok(Self::Turbo4),
             other => Err(format!(
-                "Unexpected `PagedCacheType`, got `{other}` but expected `auto` and `f8e4m3`."
+                "Unexpected `PagedCacheType`, got `{other}` but expected `auto`, `f8e4m3`, and `turbo4`."
             )),
         }
     }
@@ -561,6 +605,35 @@ impl CacheEngine {
             model_config.k_head_dim_for_layer(layer_idx),
         )
     }
+
+    /// Byte-based block shape a `Turbo4` paged KV cache layer would need: `(num_kv_heads,
+    /// block_size, bytes_per_token)`, backing a `DType::U8` tensor of shape `(num_gpu_blocks,
+    /// num_kv_heads, block_size, bytes_per_token)`.
+    ///
+    /// NOT wired into `allocate_gpu_cache` yet: `PagedCacheType::Turbo4::validate` always
+    /// errors before `CacheEngine::new` gets this far (see its doc comment), since the
+    /// paged-attention read/write kernels can't consume this layout. This exists to pin down
+    /// the shape a future kernel integration would need to target.
+    #[allow(dead_code)]
+    fn calculate_turbo4_block_shape(
+        model_config: &dyn ModelConfigLike,
+        block_size: usize,
+        layer_idx: usize,
+    ) -> Result<(usize, usize, usize)> {
+        let head_dim = model_config.k_head_dim_for_layer(layer_idx);
+        if !head_dim.is_multiple_of(turbo_quant::GROUP) {
+            return Err(candle_core::Error::msg(format!(
+                "Turbo4 KV cache requires head_dim ({head_dim}) to be a multiple of the {}-element rotation group",
+                turbo_quant::GROUP
+            )));
+        }
+        let groups_per_head = head_dim / turbo_quant::GROUP;
+        Ok((
+            model_config.num_kv_heads_for_layer(layer_idx),
+            block_size,
+            groups_per_head * turbo_quant::BLOCK_TURBO4_BYTES,
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -609,6 +682,54 @@ mod tests {
             )
             .unwrap_err();
         assert!(err.contains("not supported for MLA layer 0"));
+    }
+
+    #[test]
+    fn turbo4_cache_is_not_yet_wired_up() {
+        let err = PagedCacheType::Turbo4
+            .validate(
+                DType::BF16,
+                &model_config(KvCacheLayout::Standard),
+                &Device::Cpu,
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("scaffolding only"));
+    }
+
+    #[test]
+    fn turbo4_cache_rejects_mla_before_the_scaffolding_check() {
+        let err = PagedCacheType::Turbo4
+            .validate(
+                DType::BF16,
+                &model_config(KvCacheLayout::Mla {
+                    kv_lora_rank: 512,
+                    kpe_head_dim: 64,
+                }),
+                &Device::Cpu,
+                &[],
+            )
+            .unwrap_err();
+        assert!(err.contains("does not support the Mla"));
+    }
+
+    #[test]
+    fn turbo4_cache_rejects_head_dim_not_a_multiple_of_the_group_size() {
+        let mut model = model_config(KvCacheLayout::Standard);
+        model.k_head_dim = 96;
+        let err = PagedCacheType::Turbo4
+            .validate(DType::BF16, &model, &Device::Cpu, &[])
+            .unwrap_err();
+        assert!(err.contains("multiple of the 128-element rotation group"));
+    }
+
+    #[test]
+    fn turbo4_block_shape_packs_one_group_per_head() -> Result<()> {
+        let model = model_config(KvCacheLayout::Standard);
+        let shape = CacheEngine::calculate_turbo4_block_shape(&model, 32, 0)?;
+        // 4 kv heads, block_size 32 tokens, 66 packed bytes per 128-wide head vector.
+        assert_eq!(shape, (4, 32, 66));
+        Ok(())
     }
 
     #[cfg(all(feature = "cuda", target_family = "unix"))]
