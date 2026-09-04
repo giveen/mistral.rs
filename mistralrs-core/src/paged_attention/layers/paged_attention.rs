@@ -2042,6 +2042,103 @@ impl PagedAttention {
     /// layer-adaptive (boundary-layer K+V upgrade) decisions -- both ported from the upstream
     /// reference after it turned out those fallbacks are what makes Turbo4 safe to use on models
     /// like Qwen2.5 in the first place (see module docs).
+    /// Batched replacement for `forward_turbo4`'s per-row read loop: gathers (and, for the
+    /// packed side, dequantizes + inverse-rotates) K/V for the *entire* batch in two kernel
+    /// launches total, using `mistralrs_paged_attn::gather_turbo4_cache`/`gather_plain_kv_cache`
+    /// -- both take `block_tables`/`cu_seq_lens` as GPU tensors, unlike the per-row loop this
+    /// replaces, which pulled each row's block table to the host via `.to_vec1()`. That per-row
+    /// host readback was both a real sync cost every decode step and, worse, not safe to capture
+    /// into a CUDA graph (a captured graph would replay with whatever block-table values were
+    /// live at capture time, silently wrong for any other request). Mirrors the native
+    /// (non-Turbo4) decode path's `run_decode_gather_sdpa`.
+    ///
+    /// Only handles `AttentionMask::None`/`CausalFlash`; `forward_turbo4` falls back to the
+    /// per-row loop for `AttentionMask::Custom` (noncausal multimodal prefix ranges etc), which
+    /// this doesn't attempt to reconstruct in padded/batched form.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[allow(clippy::too_many_arguments)]
+    fn forward_turbo4_batched_gather(
+        &self,
+        ctx: &PagedForwardCtx<'_>,
+        tensors: PagedForwardTensors<'_>,
+        key_cache: &Tensor,
+        value_cache: &Tensor,
+        key_is_turbo: bool,
+        value_is_turbo: bool,
+        query: &Tensor,
+        block_tables: &Tensor,
+        context_lens_cpu: Option<&[usize]>,
+    ) -> Result<Tensor> {
+        let PagedForwardDims {
+            batch_size,
+            seq_len,
+            head_size,
+            key_value_heads,
+            ..
+        } = ctx.dims;
+        let device = query.device();
+
+        let kv_lens: Vec<usize> = match context_lens_cpu {
+            Some(lens) => lens.to_vec(),
+            None => vec![seq_len; batch_size],
+        };
+        let num_kv_tokens = checked_sequence_token_count(&kv_lens)?;
+        let cu_kv = cumulative_seqlens_from_lengths(&kv_lens, device)?;
+        let block_tables_u32 = block_tables.to_dtype(DType::U32)?;
+
+        let gather_side = |cache: &Tensor, is_turbo: bool| -> Result<Tensor> {
+            if is_turbo {
+                mistralrs_paged_attn::gather_turbo4_cache(
+                    cache,
+                    &block_tables_u32,
+                    &cu_kv,
+                    num_kv_tokens,
+                    query.dtype(),
+                )
+            } else {
+                mistralrs_paged_attn::gather_plain_kv_cache(
+                    cache,
+                    &block_tables_u32,
+                    &cu_kv,
+                    num_kv_tokens,
+                )
+            }
+        };
+        let k_gathered = gather_side(key_cache, key_is_turbo)?;
+        let v_gathered = gather_side(value_cache, value_is_turbo)?;
+
+        // unpack_gathered_kv's transpose leaves a non-contiguous view; the eager (non-flash)
+        // matmul path Sdpa falls back to when flash-attn isn't available requires contiguous
+        // operands, so force it here rather than relying on every attention backend to cope.
+        let k_batched =
+            unpack_gathered_kv(&k_gathered, &kv_lens, key_value_heads, head_size, device)?.contiguous()?;
+        let v_batched =
+            unpack_gathered_kv(&v_gathered, &kv_lens, key_value_heads, head_size, device)?.contiguous()?;
+
+        // unpack_gathered_kv zero-pads rows shorter than the batch max; a plain None/CausalFlash
+        // mask has no way to know about that padding, so rebuild an explicit mask whenever
+        // lengths actually differ (or a sliding window needs one regardless).
+        let max_kv = kv_lens.iter().copied().max().unwrap_or(0);
+        let mask = if ctx.sdpa_params.sliding_window.is_some()
+            || kv_lens.iter().any(|&len| len != max_kv)
+        {
+            prefix_gather_causal_mask(
+                &vec![seq_len; batch_size],
+                &kv_lens,
+                None,
+                seq_len,
+                max_kv,
+                ctx.sdpa_params.sliding_window,
+                query.dtype(),
+                device,
+            )?
+        } else {
+            tensors.attention_mask.clone()
+        };
+
+        Sdpa.run_attention(query, &k_batched, &v_batched, &mask, None, ctx.sdpa_params)
+    }
+
     fn forward_turbo4(
         &self,
         ctx: &PagedForwardCtx<'_>,
@@ -2175,6 +2272,21 @@ impl PagedAttention {
         } else {
             tensors.query.clone()
         };
+
+        #[cfg(all(feature = "cuda", target_family = "unix"))]
+        if device.is_cuda() && !matches!(tensors.attention_mask, AttentionMask::Custom(_)) {
+            return self.forward_turbo4_batched_gather(
+                ctx,
+                tensors,
+                key_cache,
+                value_cache,
+                key_is_turbo,
+                value_is_turbo,
+                &query,
+                block_tables,
+                context_lens_cpu,
+            );
+        }
 
         let mut outputs = Vec::with_capacity(batch_size);
         for b in 0..batch_size {

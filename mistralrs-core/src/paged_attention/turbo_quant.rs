@@ -835,6 +835,138 @@ mod tests {
         Ok(())
     }
 
+    /// Validates the fused CUDA gather kernel (`mistralrs_paged_attn::gather_turbo4_cache`)
+    /// against the eager Tensor-op reference (`read_turbo4_cache`) it's meant to replace in
+    /// `forward_turbo4`: same packed cache, same block table, dequantized independently by two
+    /// different code paths, and the results must agree closely. Also exercises a batch of two
+    /// sequences with different lengths through one kernel launch, since that's the whole point
+    /// of `cu_seq_lens`-based addressing (a real forward pass gathers the entire batch in one
+    /// call instead of the old per-row Rust loop).
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    fn gather_turbo4_cache_kernel_matches_eager_reference() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        const NUM_BLOCKS: usize = 4;
+        const BLOCK_SIZE: usize = 2;
+        const KV_HEADS: usize = 1;
+        const GROUPS_PER_HEAD: usize = 1;
+
+        // Two sequences sharing one physical cache: seq 0 has 3 tokens (slots 0..3, spanning
+        // blocks 0-1), seq 1 has 1 token (slot 4, block 2). Block 3 is never written.
+        let tokens: Vec<[f32; GROUP]> = [7, 13, 29, 41].iter().map(|&s| test_vector(s)).collect();
+        let flat: Vec<f32> = tokens.iter().flatten().copied().collect();
+        let x = Tensor::from_slice(&flat, (4, KV_HEADS, GROUPS_PER_HEAD, GROUP), &device)?;
+
+        let flat_cache = Tensor::zeros(
+            (
+                NUM_BLOCKS * BLOCK_SIZE,
+                KV_HEADS,
+                GROUPS_PER_HEAD,
+                BLOCK_TURBO4_BYTES,
+            ),
+            DType::U8,
+            &device,
+        )?;
+        let slot_mapping = Tensor::new(&[0i64, 1, 2, 4], &device)?;
+        write_turbo4_cache(&x, &flat_cache, &slot_mapping)?;
+
+        let block_cache = flat_cache.reshape((
+            NUM_BLOCKS,
+            BLOCK_SIZE,
+            KV_HEADS,
+            GROUPS_PER_HEAD,
+            BLOCK_TURBO4_BYTES,
+        ))?;
+
+        // Eager reference: one `read_turbo4_cache` call per sequence.
+        let seq0_ref = read_turbo4_cache(&block_cache, &[0, 1], 3)?; // blocks 0,1 -> slots 0..3
+        let seq1_ref = read_turbo4_cache(&block_cache, &[2], 1)?; // block 2 -> slot 4
+
+        // Fused kernel: one call across both sequences.
+        let block_table = Tensor::from_slice(&[0u32, 1, 2, 0], (2, 2), &device)?; // [batch=2, max_blocks=2]
+        let cu_seq_lens = Tensor::from_slice(&[0i32, 3, 4], (3,), &device)?; // seq0: [0,3), seq1: [3,4)
+        let gathered =
+            mistralrs_paged_attn::gather_turbo4_cache(&block_cache, &block_table, &cu_seq_lens, 4, DType::F32)?;
+        assert_eq!(gathered.dims(), &[4, KV_HEADS, GROUP]);
+
+        let seq0_kernel = gathered.narrow(0, 0, 3)?.reshape((3, KV_HEADS, GROUPS_PER_HEAD, GROUP))?;
+        let seq1_kernel = gathered.narrow(0, 3, 1)?.reshape((1, KV_HEADS, GROUPS_PER_HEAD, GROUP))?;
+
+        for (name, reference, kernel, len) in
+            [("seq0", &seq0_ref, &seq0_kernel, 3), ("seq1", &seq1_ref, &seq1_kernel, 1)]
+        {
+            let ref_vals: Vec<f32> = reference.reshape(len * GROUP)?.to_vec1()?;
+            let kernel_vals: Vec<f32> = kernel.reshape(len * GROUP)?.to_vec1()?;
+            for i in 0..len {
+                let a: [f32; GROUP] = ref_vals[i * GROUP..(i + 1) * GROUP].try_into().unwrap();
+                let b: [f32; GROUP] = kernel_vals[i * GROUP..(i + 1) * GROUP].try_into().unwrap();
+                let sim = cosine_similarity(&a, &b);
+                assert!(sim > 0.999, "{name} token {i}: kernel vs eager reference cosine too low: {sim}");
+                for (av, bv) in a.iter().zip(b.iter()) {
+                    assert!(
+                        (av - bv).abs() < 1e-3,
+                        "{name} token {i}: kernel vs eager reference element mismatch: {av} vs {bv}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Same idea as [`gather_turbo4_cache_kernel_matches_eager_reference`] but for the plain
+    /// (unquantized) fallback side: `mistralrs_paged_attn::gather_plain_kv_cache` against
+    /// `read_plain_cache`.
+    #[cfg(all(feature = "cuda", target_family = "unix"))]
+    #[test]
+    fn gather_plain_kv_cache_kernel_matches_eager_reference() -> Result<()> {
+        let Ok(device) = Device::new_cuda(0) else {
+            return Ok(());
+        };
+        const NUM_BLOCKS: usize = 4;
+        const BLOCK_SIZE: usize = 2;
+        const KV_HEADS: usize = 1;
+        const HEAD_DIM: usize = GROUP;
+
+        let tokens: Vec<[f32; HEAD_DIM]> = [7, 13, 29, 41].iter().map(|&s| test_vector(s)).collect();
+        let flat: Vec<f32> = tokens.iter().flatten().copied().collect();
+        let x = Tensor::from_slice(&flat, (4, KV_HEADS, HEAD_DIM), &device)?;
+
+        let flat_cache = Tensor::zeros((NUM_BLOCKS * BLOCK_SIZE, KV_HEADS, HEAD_DIM), DType::BF16, &device)?;
+        let slot_mapping = Tensor::new(&[0i64, 1, 2, 4], &device)?;
+        write_plain_cache(&x, &flat_cache, &slot_mapping)?;
+
+        let block_cache = flat_cache.reshape((NUM_BLOCKS, BLOCK_SIZE, KV_HEADS, HEAD_DIM))?;
+
+        let seq0_ref = read_plain_cache(&block_cache, &[0, 1], 3)?.to_dtype(DType::F32)?;
+        let seq1_ref = read_plain_cache(&block_cache, &[2], 1)?.to_dtype(DType::F32)?;
+
+        let block_table = Tensor::from_slice(&[0u32, 1, 2, 0], (2, 2), &device)?;
+        let cu_seq_lens = Tensor::from_slice(&[0i32, 3, 4], (3,), &device)?;
+        let gathered =
+            mistralrs_paged_attn::gather_plain_kv_cache(&block_cache, &block_table, &cu_seq_lens, 4)?
+                .to_dtype(DType::F32)?;
+        assert_eq!(gathered.dims(), &[4, KV_HEADS, HEAD_DIM]);
+
+        let seq0_kernel = gathered.narrow(0, 0, 3)?;
+        let seq1_kernel = gathered.narrow(0, 3, 1)?;
+
+        for (name, reference, kernel, len) in
+            [("seq0", &seq0_ref, &seq0_kernel, 3), ("seq1", &seq1_ref, &seq1_kernel, 1)]
+        {
+            let ref_vals: Vec<f32> = reference.reshape(len * HEAD_DIM)?.to_vec1()?;
+            let kernel_vals: Vec<f32> = kernel.reshape(len * HEAD_DIM)?.to_vec1()?;
+            for (av, bv) in ref_vals.iter().zip(kernel_vals.iter()) {
+                assert!(
+                    (av - bv).abs() < 1e-3,
+                    "{name}: plain kernel vs eager reference element mismatch: {av} vs {bv}"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The plain elementwise fallback (`turbo4_layer_plan`'s auto-asymmetric/layer-adaptive
     /// escape hatch): no WHT rotation or centroid quantization, just a cast into the cache's own
     /// dtype, so recovered values should match far more tightly than the 4-bit round trip above.

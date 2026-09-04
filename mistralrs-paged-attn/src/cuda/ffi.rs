@@ -272,6 +272,36 @@ extern "C" {
         cache_dtype: u32,
     );
 
+    pub fn gather_turbo4_cache(
+        cache: *const c_void,
+        out: *const c_void,
+        block_table: *const c_int,
+        cu_seq_lens: *const c_int,
+        num_tokens: c_int,
+        num_seqs: c_int,
+        block_size: c_int,
+        block_table_stride: c_int,
+        kv_heads: c_int,
+        groups_per_head: c_int,
+        stream: CUstream,
+        out_dtype: u32,
+    );
+
+    pub fn gather_plain_kv_cache(
+        cache: *const c_void,
+        out: *const c_void,
+        block_table: *const c_int,
+        cu_seq_lens: *const c_int,
+        num_tokens: c_int,
+        num_seqs: c_int,
+        block_size: c_int,
+        block_table_stride: c_int,
+        kv_heads: c_int,
+        head_size: c_int,
+        stream: CUstream,
+        dtype: u32,
+    );
+
     pub fn paged_attention_v1_f16(
         out: *const c_void,
         query: *const c_void,

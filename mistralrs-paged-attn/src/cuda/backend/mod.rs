@@ -4,6 +4,7 @@ mod fa3;
 mod flash_attn_sinks;
 mod flashinfer;
 mod gather_kv;
+mod gather_turbo4;
 mod mla;
 mod paged_attention;
 mod scale_update;
@@ -25,6 +26,7 @@ pub use flashinfer::{
     reshape_and_cache_flashinfer, FlashInferDecodeScratch,
 };
 pub use gather_kv::gather_kv_cache;
+pub use gather_turbo4::{gather_plain_kv_cache, gather_turbo4_cache};
 pub use mla::{concat_and_cache_mla, flashinfer_mla_decode, gather_mla_cache};
 pub use paged_attention::{paged_attention, reshape_and_cache};
 pub use scale_update::kv_scale_update;
